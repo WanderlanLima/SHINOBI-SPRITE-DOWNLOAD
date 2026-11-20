@@ -95,10 +95,16 @@ function findEntryWithExtFallback(reader: RemoteZipReader, relPath: string) {
   return null;
 }
 
+export interface FetchAssetOptions {
+  timeoutMs?: number;
+  noStore?: boolean;
+}
+
 export async function fetchAssetBytes(
   cdnBase: string,
   relUrl: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  options?: FetchAssetOptions
 ): Promise<Uint8Array> {
   const cleanRel = relUrl.replace(/^\/+/, '');
   if (cdnBase.startsWith(ZIP_BACKUP_PREFIX) || relUrl.startsWith(ZIP_BACKUP_PREFIX)) {
@@ -113,11 +119,114 @@ export async function fetchAssetBytes(
   const fullUrl = /^https?:\/\//i.test(relUrl)
     ? relUrl
     : `${cdnBase.replace(/\/?$/, '/')}${cleanRel}`;
-  const res = await fetch(fullUrl, { signal });
-  if (!res.ok) {
-    throw new Error(`Falha ao carregar ${cleanRel} (HTTP ${res.status}).`);
+
+  const timeoutMs = options?.timeoutMs;
+  if (!timeoutMs) {
+    const res = await fetch(fullUrl, {
+      signal,
+      cache: options?.noStore ? 'no-store' : undefined,
+    });
+    if (!res.ok) {
+      throw new Error(`Falha ao carregar ${cleanRel} (HTTP ${res.status}).`);
+    }
+    return new Uint8Array(await res.arrayBuffer());
   }
-  return new Uint8Array(await res.arrayBuffer());
+
+  const timeoutCtrl = new AbortController();
+  let timedOut = false;
+  const onOuterAbort = () => timeoutCtrl.abort();
+  if (signal) {
+    if (signal.aborted) {
+      throw new DOMException('Requisição cancelada.', 'AbortError');
+    }
+    signal.addEventListener('abort', onOuterAbort, { once: true });
+  }
+  const timer = globalThis.setTimeout(() => {
+    timedOut = true;
+    timeoutCtrl.abort();
+  }, timeoutMs);
+
+  try {
+    const res = await fetch(fullUrl, {
+      signal: timeoutCtrl.signal,
+      cache: options?.noStore ? 'no-store' : undefined,
+    });
+    if (!res.ok) {
+      const err = new Error(`Falha ao carregar ${cleanRel} (HTTP ${res.status}).`) as Error & {
+        status?: number;
+      };
+      err.status = res.status;
+      throw err;
+    }
+    // Also guard arrayBuffer() reading inside the same timeout window!
+    const buf = await res.arrayBuffer();
+    return new Uint8Array(buf);
+  } catch (err) {
+    if (timedOut) {
+      throw new Error(`Timeout (${Math.round(timeoutMs / 1000)}s) ao baixar ${cleanRel}`);
+    }
+    throw err;
+  } finally {
+    globalThis.clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onOuterAbort);
+  }
+}
+
+/**
+ * Baixa um asset com timeout por tentativa, bypass de cache HTTP (`no-store` evita travar o cache
+ * do navegador em backups de 12 GB+) e retentativas automáticas com backoff exponencial.
+ */
+export async function fetchAssetBytesWithRetry(
+  cdnBase: string,
+  relUrl: string,
+  opts: {
+    signal?: AbortSignal;
+    timeoutMs?: number;
+    maxRetries?: number;
+    noStore?: boolean;
+  } = {}
+): Promise<Uint8Array> {
+  const { signal, timeoutMs = 18000, maxRetries = 3, noStore = true } = opts;
+  let lastErr: unknown = null;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (signal?.aborted) {
+      throw new DOMException('Download cancelado.', 'AbortError');
+    }
+    try {
+      return await fetchAssetBytes(cdnBase, relUrl, signal, {
+        // Increase timeout slightly on retries for larger video/atlas files
+        timeoutMs: timeoutMs + attempt * 8000,
+        noStore,
+      });
+    } catch (err) {
+      if (signal?.aborted || (err as Error)?.name === 'AbortError') {
+        throw err;
+      }
+      lastErr = err;
+      const status = (err as { status?: number })?.status;
+      // Don't retry permanent 404/403 client errors
+      if (status === 404 || status === 403) break;
+      if (attempt < maxRetries) {
+        const delay = Math.min(4000, 350 * Math.pow(2, attempt) + Math.random() * 250);
+        await new Promise<void>((resolve) => {
+          const t = globalThis.setTimeout(resolve, delay);
+          if (signal) {
+            signal.addEventListener(
+              'abort',
+              () => {
+                globalThis.clearTimeout(t);
+                resolve();
+              },
+              { once: true }
+            );
+          }
+        });
+      }
+    }
+  }
+
+  throw lastErr instanceof Error ? lastErr : new Error(`Falha ao baixar ${relUrl}`);
 }
 
 export async function fetchAssetText(

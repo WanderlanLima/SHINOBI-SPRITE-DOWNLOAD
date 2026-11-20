@@ -1,4 +1,5 @@
 import {
+  Film,
   Maximize2,
   Pause,
   Play,
@@ -11,8 +12,9 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   loadImageWithFallback,
   resolvePlayableUrl,
+  useResolvedAssetUrl,
 } from '../services/assetSource';
-import { inspectSpineLive } from '../services/catalogEngine';
+import { type FullCatalog, inspectSpineLive } from '../services/catalogEngine';
 import type {
   NinjaRecord,
   NinjaSkillSlot,
@@ -22,17 +24,64 @@ import type {
 } from '../types';
 import { resolveCdnUrl } from '../utils/format';
 import {
+  type DiscoveredSkeletonResources,
+  extractAllSkeletonCmdResources,
+} from '../utils/spineCmdParser';
+import {
   type CompiledSpineSkeleton,
   compileSpineSkeleton,
   getAnimationDuration,
-  renderSpineAtTime,
+  renderSpineScene,
 } from '../utils/spineRenderer';
+import {
+  type LoadedVfxSpine,
+  buildSceneLayersAtTime,
+  computeSceneBoundsWithVfx,
+  loadVfxSpinesForTimeline,
+  resolveEffectiveAnimation,
+} from '../utils/spineVfxLoader';
 import { AssetImage } from './AssetImage';
 
 interface NinjaSkillShowcaseProps {
   ninja: NinjaRecord;
-  cdnBase: string;
+  catalog: FullCatalog;
   onOpenFullPlayer: (bundle: SpineBundle, title: string, initialAnim?: string) => void;
+  onSkeletonResourcesDiscovered?: (resources: DiscoveredSkeletonResources) => void;
+}
+
+function InlineCutsceneVideo({
+  videoUrl,
+  cdnBase,
+  onClose,
+}: {
+  videoUrl: string;
+  cdnBase: string;
+  onClose: () => void;
+}) {
+  const src = useResolvedAssetUrl(resolveCdnUrl(cdnBase, videoUrl));
+  return (
+    <div className="relative w-full h-full bg-[#07090E] flex items-center justify-center">
+      {src ? (
+        <video
+          src={src}
+          controls
+          autoPlay
+          playsInline
+          onEnded={onClose}
+          className="w-full h-full object-contain"
+        />
+      ) : (
+        <div className="text-xs text-[#8E97AB]">Carregando cutscene MP4...</div>
+      )}
+      <button
+        type="button"
+        onClick={onClose}
+        className="absolute top-2 right-2 z-20 px-2 py-1 text-[10px] font-medium bg-[#0B0D12]/85 hover:bg-[#EA580C] text-white border border-[#2C344A] rounded transition-colors"
+      >
+        Voltar ao Sprite
+      </button>
+    </div>
+  );
 }
 
 function pickBestBattleSpine(ninja: NinjaRecord): SpineBundle | null {
@@ -52,77 +101,115 @@ function pickBestBattleSpine(ninja: NinjaRecord): SpineBundle | null {
 
 function resolveAnimationForSlot(
   slot: NinjaSkillSlot,
-  availableAnims: string[]
+  availableAnims: string[],
+  rawSkeleton: Record<string, any> | null | undefined
 ): { animName: string; idleName: string } {
-  const lowerMap = new Map<string, string>();
+  const exactSet = new Set(availableAnims);
+  const firstLowerMap = new Map<string, string>();
   for (const name of availableAnims) {
-    lowerMap.set(name.toLowerCase(), name);
+    const k = name.toLowerCase();
+    // Preserva a PRIMEIRA ocorrência (ex: 'UniqueSkill' antes de 'uniqueSkill' delegada!)
+    if (!firstLowerMap.has(k)) firstLowerMap.set(k, name);
   }
+
+  const pickCandidate = (candidates: string[]): string | null => {
+    for (const c of candidates) {
+      if (exactSet.has(c)) return c;
+    }
+    for (const c of candidates) {
+      const hit = firstLowerMap.get(c.toLowerCase());
+      if (hit) return hit;
+    }
+    return null;
+  };
 
   const idleName =
-    lowerMap.get('idle') ||
-    lowerMap.get('stand') ||
-    lowerMap.get('loop') ||
-    availableAnims[0] ||
-    '';
+    pickCandidate(['idle', 'stand', 'loop']) || availableAnims[0] || '';
 
-  for (const candidate of slot.preferredAnims) {
-    const hit = lowerMap.get(candidate.toLowerCase());
-    if (hit) return { animName: hit, idleName };
-  }
+  const finalize = (candidate: string): { animName: string; idleName: string } => {
+    const resolved = resolveEffectiveAnimation(rawSkeleton, candidate);
+    return { animName: resolved.animName || candidate, idleName };
+  };
 
+  const fromPreferred = pickCandidate(slot.preferredAnims);
+  if (fromPreferred) return finalize(fromPreferred);
+
+  // Mapeamento oficial confirmado no jogo:
+  // s1 = Ogi (Esotérica) -> UniqueSkill
+  // n1 = Ataque Normal   -> attack
+  // a1 = Habilidade      -> skill
+  // c1 = Perseguição 1   -> chase1
+  // c2 = Perseguição 2   -> chase2
+  // p1/p2 = Passivas     -> idle
   const code = slot.slotCode.toLowerCase();
-  if (code.startsWith('n')) {
-    const hit = availableAnims.find((a) => /unique|aoyi|super|skill/i.test(a));
-    if (hit) return { animName: hit, idleName };
-  } else if (code.startsWith('s')) {
-    const hit = availableAnims.find((a) => /^skill|unique/i.test(a));
-    if (hit) return { animName: hit, idleName };
+  if (code.startsWith('s')) {
+    const hit =
+      pickCandidate(['UniqueSkill', 'uniqueSkill', 'superUniqueSkill']) ||
+      availableAnims.find((a) => /unique|aoyi|super/i.test(a));
+    if (hit) return finalize(hit);
+  } else if (code.startsWith('n')) {
+    const hit =
+      pickCandidate(['attack', 'attackAction']) ||
+      availableAnims.find((a) => /^attack|atk/i.test(a));
+    if (hit) return finalize(hit);
   } else if (code.startsWith('a')) {
-    const hit = availableAnims.find((a) => /attack|atk/i.test(a));
-    if (hit) return { animName: hit, idleName };
+    const hit =
+      pickCandidate(['skill', 'skillAction']) ||
+      availableAnims.find((a) => /^skill/i.test(a));
+    if (hit) return finalize(hit);
+  } else if (code === 'c2') {
+    const hit =
+      pickCandidate(['chase2', 'chase2Action', 'chase1']) ||
+      availableAnims.find((a) => /chase2|chase/i.test(a));
+    if (hit) return finalize(hit);
   } else if (code.startsWith('c')) {
-    const hit = availableAnims.find((a) => /chase|combo|attack/i.test(a));
-    if (hit) return { animName: hit, idleName };
+    const hit =
+      pickCandidate(['chase1', 'chase1Action', 'chase']) ||
+      availableAnims.find((a) => /chase|combo/i.test(a));
+    if (hit) return finalize(hit);
   }
 
   return { animName: idleName, idleName };
 }
 
-function pickAudioForSlot(ninja: NinjaRecord, slotCode: string): string | null {
+function pickOfficialHeroVoiceForSlot(
+  ninja: NinjaRecord,
+  slotCode: string,
+  hasCmdSounds: boolean
+): string | null {
   if (ninja.audioFiles.length === 0) return null;
   const code = slotCode.toLowerCase();
   if (code.startsWith('p')) return null;
 
-  if (code.startsWith('n')) {
-    const esot =
-      ninja.audioFiles.find((a) => a.category === 'dublagem_esoterica') ||
-      ninja.audioFiles.find((a) => /^2\d{3}_/.test(a.filename));
+  // s1 = Ogi (Esotérica) -> dublagem oficial AFaoyi/<id>_aoyiaf.mp3 do próprio herói
+  if (code.startsWith('s')) {
+    const esot = ninja.audioFiles.find((a) => a.category === 'dublagem_esoterica');
     if (esot) return esot.url;
-  } else if (code.startsWith('c')) {
-    const chase =
-      ninja.audioFiles.find((a) => /^3\d{3}_/.test(a.filename)) ||
-      ninja.audioFiles.find((a) => /^1\d{3}_/.test(a.filename));
-    if (chase) return chase.url;
-  } else if (code.startsWith('s') || code.startsWith('a')) {
-    const atk =
-      ninja.audioFiles.find((a) => /^1\d{3}_/.test(a.filename)) ||
-      ninja.audioFiles.find((a) => a.category === 'dublagem_falas');
-    if (atk) return atk.url;
   }
+
+  // Só usa fala genérica do herói se a faixa não possuir eventos @CMD {SOUND} próprios
+  if (!hasCmdSounds) {
+    const line = ninja.audioFiles.find((a) => a.category === 'dublagem_falas');
+    if (line) return line.url;
+  }
+
   return null;
 }
 
 export function NinjaSkillShowcase({
   ninja,
-  cdnBase,
+  catalog,
   onOpenFullPlayer,
+  onSkeletonResourcesDiscovered,
 }: NinjaSkillShowcaseProps) {
+  const cdnBase = catalog.summary.cdnBase;
   const battleSpine = useMemo(() => pickBestBattleSpine(ninja), [ninja]);
 
   const [selectedSlotCode, setSelectedSlotCode] = useState<string | null>(null);
   const [playNonce, setPlayNonce] = useState(0);
   const [soundEnabled, setSoundEnabled] = useState(true);
+  const [showVfx, setShowVfx] = useState(true);
+  const [showCutscene, setShowCutscene] = useState(false);
   const [playing, setPlaying] = useState(true);
 
   const [loadingSpine, setLoadingSpine] = useState(false);
@@ -130,42 +217,59 @@ export function NinjaSkillShowcase({
   const [spineData, setSpineData] = useState<SpineInspectionResult | null>(null);
   const [loadedImages, setLoadedImages] = useState<Record<string, HTMLImageElement>>({});
 
-  // Live animation state (plays skill once, then smoothly loops idle like in the game!)
+  const [activeVfxMap, setActiveVfxMap] = useState<Map<string, LoadedVfxSpine>>(new Map());
+  const [loadingVfx, setLoadingVfx] = useState(false);
+
+  // Live animation state (plays skill once with VFX + SFX, then smoothly loops idle)
   const [activeAnimName, setActiveAnimName] = useState('');
   const [isReturningIdle, setIsReturningIdle] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [currentDuration, setCurrentDuration] = useState(0);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const activeAudiosRef = useRef<Set<HTMLAudioElement>>(new Set());
+  const firedSoundsRef = useRef<Set<number>>(new Set());
+  const vfxCacheRef = useRef<Map<string, LoadedVfxSpine | null>>(new Map());
   const timeRef = useRef(0);
   const lastRafRef = useRef<number | null>(null);
+
+  const stopAllAudio = () => {
+    for (const aud of activeAudiosRef.current) {
+      try {
+        aud.pause();
+        aud.currentTime = 0;
+      } catch {
+        // ignore
+      }
+    }
+    activeAudiosRef.current.clear();
+  };
 
   // Reset state when switching to a different ninja
   useEffect(() => {
     setSelectedSlotCode(null);
     setActiveAnimName('');
     setIsReturningIdle(false);
+    setShowCutscene(false);
     setCurrentTime(0);
     setCurrentDuration(0);
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current = null;
-    }
+    setActiveVfxMap(new Map());
+    firedSoundsRef.current.clear();
+    stopAllAudio();
   }, [ninja.id]);
 
-  // Stop audio on unmount
+  // Stop audio on unmount or mute
+  useEffect(() => {
+    if (!soundEnabled) stopAllAudio();
+  }, [soundEnabled]);
+
   useEffect(() => {
     return () => {
-      if (audioRef.current) {
-        audioRef.current.pause();
-        audioRef.current = null;
-      }
+      stopAllAudio();
     };
   }, []);
 
   // Preload the ninja's battle Spine cleanly whenever battleSpine or cdnBase changes.
-  // NOTE: loadingSpine is intentionally NOT in the dependency array so React does not cancel the fetch!
   useEffect(() => {
     if (!battleSpine) {
       setSpineData(null);
@@ -186,6 +290,10 @@ export function NinjaSkillShowcase({
         const data = await inspectSpineLive(cdnBase, battleSpine!.jsonUrl, battleSpine!.atlasUrl);
         if (cancelled) return;
         setSpineData(data);
+
+        if (data.rawSkeleton && onSkeletonResourcesDiscovered) {
+          onSkeletonResourcesDiscovered(extractAllSkeletonCmdResources(data.rawSkeleton));
+        }
 
         const imgs: Record<string, HTMLImageElement> = {};
         await Promise.all(
@@ -225,9 +333,50 @@ export function NinjaSkillShowcase({
     if (!selectedSlot || !spineData) return { animName: '', idleName: '' };
     return resolveAnimationForSlot(
       selectedSlot,
-      spineData.animations.map((a) => a.name)
+      spineData.animations.map((a) => a.name),
+      spineData.rawSkeleton
     );
   }, [selectedSlot, spineData]);
+
+  // Parse @CMD events (VFX, sounds, cutscene video, screen shake, backdrop dim) for the active skill track
+  const activeTimeline = useMemo(() => {
+    if (!spineData?.rawSkeleton || !resolvedTracks.animName) return null;
+    return resolveEffectiveAnimation(spineData.rawSkeleton, resolvedTracks.animName).timeline;
+  }, [spineData, resolvedTracks.animName]);
+
+  // Resolve cutscene MP4 URL if this skill track triggers `{PLAYVEDIO}`
+  const skillCutsceneUrl = useMemo(() => {
+    if (!activeTimeline || activeTimeline.videos.length === 0) return null;
+    const first = activeTimeline.videos[0];
+    const targetLower = first.source.toLowerCase();
+    const matched = catalog.videos.find(
+      (v) => v.filename.replace(/\.mp4$/i, '').toLowerCase() === targetLower
+    );
+    return matched ? matched.url : `acervo/video/hero/${first.filename}`;
+  }, [activeTimeline, catalog.videos]);
+
+  // Load any `noe_*` VFX Spine overlays referenced by this skill's @CMD events
+  useEffect(() => {
+    if (!activeTimeline || activeTimeline.vfx.length === 0 || !showVfx) {
+      setActiveVfxMap(new Map());
+      setLoadingVfx(false);
+      return;
+    }
+
+    let cancelled = false;
+    setLoadingVfx(true);
+    loadVfxSpinesForTimeline(activeTimeline.vfx, catalog, vfxCacheRef.current)
+      .then((map) => {
+        if (!cancelled) setActiveVfxMap(map);
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingVfx(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTimeline, catalog, showVfx]);
 
   // Fallback frames in case a non-standard Spine track relies purely on region attachments
   const fallbackFrames = useMemo(() => {
@@ -248,44 +397,56 @@ export function NinjaSkillShowcase({
     return list;
   }, [spineData, activeAnimName]);
 
+  const playCueUrl = (relativeUrl: string, volume = 0.65) => {
+    if (!soundEnabled) return;
+    resolvePlayableUrl(resolveCdnUrl(cdnBase, relativeUrl)).then((playable) => {
+      if (!playable) return;
+      // Avoid audio clipping when a frame triggers many simultaneous SFX
+      if (activeAudiosRef.current.size >= 5) return;
+      const aud = new Audio(playable);
+      aud.volume = volume;
+      activeAudiosRef.current.add(aud);
+      const cleanup = () => activeAudiosRef.current.delete(aud);
+      aud.addEventListener('ended', cleanup, { once: true });
+      aud.addEventListener('error', cleanup, { once: true });
+      aud.play().catch(cleanup);
+    });
+  };
+
   // Trigger skill animation from t=0 whenever user clicks a skill icon or clicks "Repetir"
   useEffect(() => {
     if (!selectedSlot || !compiledSpine || !resolvedTracks.animName) return;
     setActiveAnimName(resolvedTracks.animName);
     setIsReturningIdle(false);
+    setShowCutscene(false);
     timeRef.current = 0;
+    firedSoundsRef.current.clear();
     setCurrentTime(0);
     setCurrentDuration(getAnimationDuration(compiledSpine, resolvedTracks.animName));
     setPlaying(true);
 
-    // Trigger combat/Ogi voice dub on user click
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current = null;
-    }
+    stopAllAudio();
     if (soundEnabled) {
-      const audioUrl = pickAudioForSlot(ninja, selectedSlot.slotCode);
-      if (audioUrl) {
-        let aborted = false;
-        resolvePlayableUrl(resolveCdnUrl(cdnBase, audioUrl)).then((playable) => {
-          if (aborted || !playable) return;
-          const aud = new Audio(playable);
-          aud.volume = 0.7;
-          audioRef.current = aud;
-          aud.play().catch(() => {
-            // Ignore browser autoplay block if any
-          });
-        });
-        return () => {
-          aborted = true;
-        };
+      const hasCmdSounds = Boolean(activeTimeline && activeTimeline.sounds.length > 0);
+      const voiceUrl = pickOfficialHeroVoiceForSlot(ninja, selectedSlot.slotCode, hasCmdSounds);
+      if (voiceUrl) {
+        playCueUrl(voiceUrl, 0.72);
       }
     }
-  }, [selectedSlot, playNonce, compiledSpine, resolvedTracks.animName, ninja, cdnBase, soundEnabled]);
+  }, [
+    selectedSlot,
+    playNonce,
+    compiledSpine,
+    resolvedTracks.animName,
+    activeTimeline,
+    ninja,
+    cdnBase,
+    soundEnabled,
+  ]);
 
-  // 60 FPS live Canvas animation loop (plays skill once -> transitions back to idle loop!)
+  // 60 FPS live Canvas animation loop with multi-layer VFX + dynamic anti-clipping camera + @CMD SFX
   useEffect(() => {
-    if (!selectedSlot || !compiledSpine || !activeAnimName) return;
+    if (!selectedSlot || !compiledSpine || !activeAnimName || showCutscene) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
@@ -298,6 +459,15 @@ export function NinjaSkillShowcase({
         : activeAnimName;
     const duration = getAnimationDuration(compiledSpine, animToPlay);
     setCurrentDuration(duration);
+
+    const timelineForRender = isReturningIdle ? null : activeTimeline;
+    const sceneBounds = computeSceneBoundsWithVfx(
+      compiledSpine,
+      animToPlay,
+      timelineForRender,
+      activeVfxMap,
+      showVfx
+    );
 
     let rafId = 0;
     let lastUiSync = 0;
@@ -317,7 +487,11 @@ export function NinjaSkillShowcase({
       ctx.clearRect(0, 0, W, H);
       const srcW = reg.rotate ? reg.height : reg.width;
       const srcH = reg.rotate ? reg.width : reg.height;
-      const scale = Math.min((W * 0.78) / Math.max(1, reg.width), (H * 0.78) / Math.max(1, reg.height), 2.2);
+      const scale = Math.min(
+        (W * 0.78) / Math.max(1, reg.width),
+        (H * 0.78) / Math.max(1, reg.height),
+        2.2
+      );
       ctx.save();
       ctx.translate(W / 2, H / 2);
       ctx.scale(scale, scale);
@@ -330,14 +504,40 @@ export function NinjaSkillShowcase({
       ctx.restore();
     };
 
+    const triggerDueSounds = (t: number) => {
+      if (!soundEnabled || isReturningIdle || !activeTimeline) return;
+      for (let i = 0; i < activeTimeline.sounds.length; i++) {
+        if (firedSoundsRef.current.has(i)) continue;
+        const cue = activeTimeline.sounds[i];
+        if (t >= cue.time) {
+          firedSoundsRef.current.add(i);
+          playCueUrl(cue.assetUrl, 0.55);
+        }
+      }
+    };
+
     const drawStage = (t: number) => {
-      const res = renderSpineAtTime(ctx, compiledSpine, animToPlay, t, loadedImages, 1.05);
+      const { layers, shakeX, shakeY, bgDimAlpha } = buildSceneLayersAtTime(
+        compiledSpine,
+        animToPlay,
+        t,
+        loadedImages,
+        timelineForRender,
+        activeVfxMap,
+        showVfx
+      );
+      const res = renderSpineScene(ctx, layers, sceneBounds, 1.0, {
+        shakeX,
+        shakeY,
+        bgDimAlpha,
+      });
       if (res.drawnSlots === 0 && fallbackFrames.length > 0) {
         drawFallbackRegion(t);
       }
     };
 
     drawStage(timeRef.current);
+    if (playing) triggerDueSounds(timeRef.current);
 
     if (!playing || duration <= 0) return;
 
@@ -359,9 +559,11 @@ export function NinjaSkillShowcase({
           return;
         }
         nextT = nextT % duration;
+        firedSoundsRef.current.clear();
       }
 
       timeRef.current = nextT;
+      triggerDueSounds(nextT);
       drawStage(nextT);
 
       if (now - lastUiSync > 50) {
@@ -383,8 +585,13 @@ export function NinjaSkillShowcase({
     activeAnimName,
     isReturningIdle,
     resolvedTracks.idleName,
+    activeTimeline,
+    activeVfxMap,
+    showVfx,
+    showCutscene,
     loadedImages,
     playing,
+    soundEnabled,
     fallbackFrames,
   ]);
 
@@ -404,6 +611,8 @@ export function NinjaSkillShowcase({
   const displayedAnim =
     isReturningIdle && resolvedTracks.idleName ? resolvedTracks.idleName : activeAnimName;
   const loadedImageCount = Object.keys(loadedImages).length;
+  const totalVfxCmds = activeTimeline?.vfx.length || 0;
+  const loadedVfxCount = activeVfxMap.size;
 
   return (
     <div className="space-y-4">
@@ -445,7 +654,7 @@ export function NinjaSkillShowcase({
                 )}
               </div>
               <span
-                className={`text-[11px] font-medium leading-tight max-w-[66px] truncate ${
+                className={`text-[11px] font-medium leading-tight max-w-[68px] truncate ${
                   active ? 'text-[#FB923C]' : 'text-[#A7B0C4] group-hover:text-white'
                 }`}
               >
@@ -456,11 +665,11 @@ export function NinjaSkillShowcase({
         })}
       </div>
 
-      {/* Interactive Battle Stage + Skill Details Panel (opens when any skill icon is clicked!) */}
+      {/* Interactive Battle Stage + Skill Details Panel */}
       {selectedSlot && (
         <div className="bg-[#0F1219] border border-[#2A3144] rounded-xl overflow-hidden">
           {/* Header Strip */}
-          <div className="px-4 py-2.5 bg-[#151924] border-b border-[#222736] flex items-center justify-between gap-2">
+          <div className="px-4 py-2.5 bg-[#151924] border-b border-[#222736] flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2 min-w-0">
               <span className="text-xs font-semibold text-[#F97316] uppercase tracking-wide shrink-0">
                 {selectedSlot.label}
@@ -478,10 +687,46 @@ export function NinjaSkillShowcase({
             </div>
 
             <div className="flex items-center gap-1.5 shrink-0">
+              {totalVfxCmds > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setShowVfx((v) => !v)}
+                  title={showVfx ? 'Ocultar efeitos VFX da habilidade' : 'Mostrar efeitos VFX da habilidade'}
+                  className={`inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium transition-colors ${
+                    showVfx
+                      ? 'text-[#FB923C] bg-[#EA580C]/15 hover:bg-[#EA580C]/25'
+                      : 'text-[#7C859B] bg-[#1C2130] hover:text-white'
+                  }`}
+                >
+                  <Sparkles className="w-3 h-3" />
+                  <span>
+                    VFX{loadingVfx ? '...' : loadedVfxCount > 0 ? ` (${loadedVfxCount})` : ''}
+                  </span>
+                </button>
+              )}
+
+              {skillCutsceneUrl && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    stopAllAudio();
+                    setShowCutscene((c) => !c);
+                  }}
+                  className={`inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium transition-colors ${
+                    showCutscene
+                      ? 'text-white bg-[#EA580C]'
+                      : 'text-[#D4DAE8] bg-[#1D2230] hover:bg-[#2A3248]'
+                  }`}
+                >
+                  <Film className="w-3 h-3" />
+                  <span>Cutscene</span>
+                </button>
+              )}
+
               <button
                 type="button"
                 onClick={() => setSoundEnabled((s) => !s)}
-                title={soundEnabled ? 'Desativar som da dublagem' : 'Ativar som da dublagem'}
+                title={soundEnabled ? 'Silenciar efeitos e dublagem' : 'Ativar efeitos e dublagem'}
                 className={`p-1.5 rounded-md transition-colors ${
                   soundEnabled
                     ? 'text-[#FB923C] bg-[#EA580C]/15 hover:bg-[#EA580C]/25'
@@ -494,6 +739,7 @@ export function NinjaSkillShowcase({
                   <VolumeX className="w-3.5 h-3.5" />
                 )}
               </button>
+
               {battleSpine && (
                 <button
                   type="button"
@@ -514,48 +760,58 @@ export function NinjaSkillShowcase({
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-12">
-            {/* Live Sprite Arena Stage */}
+            {/* Live Sprite + VFX Arena Stage */}
             <div className="sm:col-span-6 relative bg-[radial-gradient(ellipse_at_50%_78%,rgba(234,88,12,0.16),rgba(11,13,18,0.98)_72%)] border-b sm:border-b-0 sm:border-r border-[#222736] flex flex-col">
-              <div className="relative h-60 sm:h-64 flex items-center justify-center overflow-hidden">
-                {/* Arena ground ring under the ninja's feet */}
-                <div
-                  aria-hidden="true"
-                  className="pointer-events-none absolute bottom-6 w-36 h-10 rounded-full border border-[#F97316]/35 bg-[#F97316]/10 blur-[1px]"
-                />
-
-                {!battleSpine ? (
-                  <div className="p-4 text-center text-xs text-[#8E97AB]">
-                    Este ninja não possui sprite Spine de batalha vinculado por ID.
-                  </div>
-                ) : loadingSpine ? (
-                  <div className="p-4 text-center text-xs text-[#8E97AB]">
-                    Carregando animação do ninja...
-                  </div>
-                ) : spineError ? (
-                  <div className="p-4 text-center text-xs text-[#FCA5A5]">{spineError}</div>
-                ) : loadedImageCount === 0 && spineData ? (
-                  <div className="p-4 text-center text-xs text-[#FCA5A5]">
-                    Textura do sprite não encontrada para este ninja.
-                  </div>
-                ) : (
-                  <canvas
-                    ref={canvasRef}
-                    width={480}
-                    height={360}
-                    className="relative z-10 w-full h-full object-contain"
+              <div className="relative h-64 sm:h-72 flex items-center justify-center overflow-hidden">
+                {showCutscene && skillCutsceneUrl ? (
+                  <InlineCutsceneVideo
+                    videoUrl={skillCutsceneUrl}
+                    cdnBase={cdnBase}
+                    onClose={() => setShowCutscene(false)}
                   />
-                )}
+                ) : (
+                  <>
+                    {/* Arena ground ring */}
+                    <div
+                      aria-hidden="true"
+                      className="pointer-events-none absolute bottom-6 w-36 h-10 rounded-full border border-[#F97316]/30 bg-[#F97316]/10 blur-[1px]"
+                    />
 
-                {displayedAnim && (
-                  <div className="absolute top-2.5 left-2.5 z-20 px-2 py-0.5 rounded bg-[#0B0D12]/85 border border-[#242B3D] text-[10px] font-mono text-[#E6E9F0]">
-                    {displayedAnim}
-                    {isReturningIdle ? ' (stance)' : ''}
-                  </div>
+                    {!battleSpine ? (
+                      <div className="p-4 text-center text-xs text-[#8E97AB]">
+                        Este ninja não possui sprite Spine de batalha vinculado por ID.
+                      </div>
+                    ) : loadingSpine ? (
+                      <div className="p-4 text-center text-xs text-[#8E97AB]">
+                        Carregando animação do ninja...
+                      </div>
+                    ) : spineError ? (
+                      <div className="p-4 text-center text-xs text-[#FCA5A5]">{spineError}</div>
+                    ) : loadedImageCount === 0 && spineData ? (
+                      <div className="p-4 text-center text-xs text-[#FCA5A5]">
+                        Textura do sprite não encontrada para este ninja.
+                      </div>
+                    ) : (
+                      <canvas
+                        ref={canvasRef}
+                        width={560}
+                        height={420}
+                        className="relative z-10 w-full h-full object-contain"
+                      />
+                    )}
+
+                    {displayedAnim && (
+                      <div className="absolute top-2.5 left-2.5 z-20 px-2 py-0.5 rounded bg-[#0B0D12]/85 border border-[#242B3D] text-[10px] font-mono text-[#E6E9F0]">
+                        {displayedAnim}
+                        {isReturningIdle ? ' (stance)' : ''}
+                      </div>
+                    )}
+                  </>
                 )}
               </div>
 
               {/* Compact Playback Strip */}
-              {battleSpine && spineData && (
+              {battleSpine && spineData && !showCutscene && (
                 <div className="px-3 py-2 bg-[#0B0D12]/90 border-t border-[#1E2331] flex items-center justify-between gap-2">
                   <div className="flex items-center gap-1.5">
                     <button
@@ -568,7 +824,12 @@ export function NinjaSkillShowcase({
                     </button>
                     <button
                       type="button"
-                      onClick={() => setPlaying((p) => !p)}
+                      onClick={() => {
+                        setPlaying((p) => {
+                          if (p) stopAllAudio();
+                          return !p;
+                        });
+                      }}
                       aria-label={playing ? 'Pausar' : 'Reproduzir'}
                       className="p-1.5 text-[#C9D1E1] bg-[#181C28] hover:bg-[#242B3D] rounded-md"
                     >
@@ -614,7 +875,7 @@ export function NinjaSkillShowcase({
                   {selectedSlot.skill?.desc ||
                     (selectedSlot.isPassive
                       ? 'Habilidade passiva ativa durante a batalha (o sprite permanece em pose de combate).'
-                      : 'Animação oficial de combate do sprite vinculada a este ícone de habilidade.')}
+                      : 'Animação oficial de combate do sprite com efeitos VFX e sons sincronizados pelo motor do jogo.')}
                 </p>
 
                 {selectedSlot.skill &&
@@ -640,7 +901,7 @@ export function NinjaSkillShowcase({
               </div>
 
               <div className="text-[11px] text-[#7C859B] pt-2 border-t border-[#1E2331]">
-                Toque nos outros ícones acima para testar cada golpe e dublagem do ninja.
+                Toque nos outros ícones acima para testar cada golpe, efeitos VFX e sons oficiais do ninja.
               </div>
             </div>
           </div>
@@ -651,7 +912,7 @@ export function NinjaSkillShowcase({
         <div className="px-3.5 py-2.5 text-xs text-[#98A1B5] bg-[#151924] border border-[#222736] rounded-lg flex items-center gap-2">
           <Play className="w-3.5 h-3.5 text-[#F97316] shrink-0" />
           <span>
-            Clique em qualquer ícone de habilidade acima para ver a animação do sprite e os detalhes do golpe ao vivo.
+            Clique em qualquer ícone de habilidade acima para ver o golpe com efeitos VFX e sons oficiais ao vivo.
           </span>
         </div>
       )}

@@ -1,12 +1,17 @@
 import { strToU8, Zip, ZipDeflate, ZipPassThrough } from 'fflate';
 import type { AssetFileRef, ManifestFile, ZipExportRequest } from '../types';
 import {
+  clearMirrorCheckpoint,
+  type MirrorBackupCheckpoint,
+  saveMirrorCheckpoint,
+} from '../utils/backupCheckpointDb';
+import {
   FileSystemWritableSink,
   MemoryBufferSink,
   StreamingZip64Writer,
   supportsFileSystemSavePicker,
 } from '../utils/zip64Stream';
-import { fetchAssetBytes } from './assetSource';
+import { fetchAssetBytesWithRetry } from './assetSource';
 import {
   buildCsvDatabase,
   fetchBundledStudioSnapshot,
@@ -30,6 +35,11 @@ export interface ZipProgress {
   bytesDownloaded: number;
   totalBytes: number;
   currentFile: string;
+  speedBytesPerSec?: number;
+  etaSeconds?: number;
+  failedCount?: number;
+  pausedOffline?: boolean;
+  stageLabel?: string;
 }
 
 export type MobilePartCategoryKey =
@@ -867,7 +877,7 @@ export function triggerBlobDownload(blob: Blob, filename: string): void {
 
 /**
  * Cria um arquivo ZIP organizado 100% no navegador (funciona no GitHub Pages e direto no celular)
- * usando fflate em modo streaming com concorrência controlada para economizar memória RAM.
+ * usando fflate em modo streaming com pool contínuo de 16 workers, timeout por arquivo e retentativas.
  */
 export async function generateAndDownloadClientZip(opts: {
   cdnBase: string;
@@ -896,6 +906,28 @@ export async function generateAndDownloadClientZip(opts: {
   let completed = 0;
   let bytesDownloaded = 0;
   let failed = 0;
+  const startTime = performance.now();
+  let lastEmit = 0;
+
+  const emitProgress = (currentFile: string, force = false) => {
+    const now = performance.now();
+    if (!force && now - lastEmit < 100) return;
+    lastEmit = now;
+    const elapsedSec = Math.max(0.25, (now - startTime) / 1000);
+    const speedBytesPerSec = bytesDownloaded / elapsedSec;
+    const remainingBytes = Math.max(0, totalBytes - bytesDownloaded);
+    const etaSeconds = speedBytesPerSec > 1024 ? remainingBytes / speedBytesPerSec : undefined;
+    onProgress?.({
+      completed,
+      total: totalCount,
+      bytesDownloaded,
+      totalBytes,
+      currentFile,
+      speedBytesPerSec,
+      etaSeconds,
+      failedCount: failed,
+    });
+  };
 
   // 1. Append text / JSON / CSV files with deflate compression
   for (const vf of virtualFiles) {
@@ -906,17 +938,11 @@ export async function generateAndDownloadClientZip(opts: {
     stream.push(encoded, true);
     completed++;
     bytesDownloaded += encoded.byteLength;
-    onProgress?.({
-      completed,
-      total: totalCount,
-      bytesDownloaded,
-      totalBytes,
-      currentFile: vf.zipPath.split('/').pop() || vf.zipPath,
-    });
+    emitProgress(vf.zipPath.split('/').pop() || vf.zipPath);
   }
 
-  // 2. Fetch binary assets with mobile-friendly concurrency (6 workers)
-  const CONCURRENCY = 6;
+  // 2. Fetch binary assets with fast continuous 16-worker pool + per-file timeout & automatic retry
+  const CONCURRENCY = 16;
   let cursor = 0;
 
   const worker = async () => {
@@ -925,7 +951,12 @@ export async function generateAndDownloadClientZip(opts: {
       const idx = cursor++;
       const item = entries[idx];
       try {
-        const buf = await fetchAssetBytes(cdnBase, item.sourceUrl, signal);
+        const buf = await fetchAssetBytesWithRetry(cdnBase, item.sourceUrl, {
+          signal,
+          timeoutMs: 18000,
+          maxRetries: 3,
+          noStore: true,
+        });
         // Use STORE (zero compression CPU overhead) for already-compressed media files
         const stream = ALREADY_COMPRESSED_EXT.test(item.zipPath)
           ? new ZipPassThrough(item.zipPath)
@@ -934,17 +965,11 @@ export async function generateAndDownloadClientZip(opts: {
         stream.push(buf, true);
         bytesDownloaded += buf.byteLength;
       } catch (err) {
-        if ((err as Error)?.name === 'AbortError') return;
+        if (signal?.aborted || (err as Error)?.name === 'AbortError') return;
         failed++;
       } finally {
         completed++;
-        onProgress?.({
-          completed,
-          total: totalCount,
-          bytesDownloaded,
-          totalBytes,
-          currentFile: item.zipPath.split('/').pop() || item.zipPath,
-        });
+        emitProgress(item.zipPath.split('/').pop() || item.zipPath);
       }
     }
   };
@@ -957,6 +982,7 @@ export async function generateAndDownloadClientZip(opts: {
     throw new DOMException('Download cancelado pelo usuário.', 'AbortError');
   }
 
+  emitProgress('Finalizando ZIP...', true);
   zip.end();
 
   const blob = new Blob(chunks, { type: 'application/zip' });
@@ -1117,158 +1143,474 @@ export function planSingleGameMirrorZip(
   };
 }
 
+async function waitUntilOnlineOrAborted(
+  signal?: AbortSignal,
+  pauseSignal?: AbortSignal
+): Promise<void> {
+  if (typeof navigator === 'undefined' || navigator.onLine !== false) return;
+  await new Promise<void>((resolve) => {
+    const done = () => {
+      window.removeEventListener('online', done);
+      signal?.removeEventListener('abort', done);
+      pauseSignal?.removeEventListener('abort', done);
+      window.clearInterval(poll);
+      resolve();
+    };
+    window.addEventListener('online', done, { once: true });
+    signal?.addEventListener('abort', done, { once: true });
+    pauseSignal?.addEventListener('abort', done, { once: true });
+    const poll = window.setInterval(() => {
+      if (navigator.onLine !== false) done();
+    }, 1500);
+  });
+}
+
 /**
  * Gera um ÚNICO arquivo ZIP64 mantendo 100% da estrutura original de naruto.jotagame.com
  * (manifesto.json + studio-snapshot.json + acervo/... + dados/... + d/...).
- * Usa File System Access API (showSaveFilePicker) para gravar direto no disco sem estourar RAM
- * (suporta 12,8 GB+!), com fallback em memória para pacotes menores (<= 600 MB).
+ *
+ * Motor de alta velocidade & anti-travamento:
+ * - Pool contínuo de 24–36 workers HTTP sem barreiras de lote (satura conexões rápidas!)
+ * - Timeout individual por arquivo (18s) + 3 retentativas automáticas + `cache: 'no-store'`
+ * - Escrita bufferizada em blocos de 8 MB (~100x menos chamadas de disco IPC no Chrome)
+ * - Suporte a Pausar e Salvar Progresso (Checkpoint no IndexedDB) + Retomar exatamente de onde parou!
+ * - Wake Lock automático para impedir suspensão do PC/celular + pausa automática se a internet cair
  */
 export async function generateSingleGameMirrorZip64(opts: {
   catalog: FullCatalog;
   scope: SingleMirrorScope;
+  concurrency?: number;
+  resumeCheckpoint?: MirrorBackupCheckpoint | null;
   onProgress?: (progress: ZipProgress) => void;
   signal?: AbortSignal;
-}): Promise<{ downloaded: number; failed: number; usedDirectDisk: boolean }> {
-  const { catalog, scope, onProgress, signal } = opts;
-  const plan = planSingleGameMirrorZip(catalog, scope);
+  pauseSignal?: AbortSignal;
+}): Promise<{
+  downloaded: number;
+  failed: number;
+  usedDirectDisk: boolean;
+  paused: boolean;
+}> {
+  const {
+    catalog,
+    scope,
+    concurrency = 24,
+    resumeCheckpoint = null,
+    onProgress,
+    signal,
+    pauseSignal,
+  } = opts;
+  const effectiveScope = resumeCheckpoint ? resumeCheckpoint.scope : scope;
+  const plan = planSingleGameMirrorZip(catalog, effectiveScope);
   const cdnBase = catalog.summary.cdnBase;
 
   let sink: FileSystemWritableSink | MemoryBufferSink | null = null;
+  let fileHandle: any = null;
   let usedDirectDisk = false;
+  let writer: StreamingZip64Writer;
 
-  if (supportsFileSystemSavePicker()) {
+  let completed = 0;
+  let bytesDownloaded = 0;
+  let initialBytesDownloaded = 0;
+  let failed = 0;
+  let totalCount = plan.files.length + 2;
+  let totalBytes = plan.totalBytes;
+  let remainingFiles: ManifestFile[] = plan.files;
+
+  if (resumeCheckpoint && resumeCheckpoint.handle) {
+    fileHandle = resumeCheckpoint.handle;
     try {
-      const picker = (window as unknown as {
-        showSaveFilePicker: (opts: unknown) => Promise<{
-          createWritable: () => Promise<{
-            write(data: Uint8Array): Promise<void>;
-            close(): Promise<void>;
-          }>;
-        }>;
-      }).showSaveFilePicker;
-      const handle = await picker({
-        suggestedName: plan.filename,
-        types: [
-          {
-            description: 'Backup Único ZIP64 (naruto.jotagame.com)',
-            accept: { 'application/zip': ['.zip'] },
-          },
-        ],
-      });
-      const writable = await handle.createWritable();
-      sink = new FileSystemWritableSink(writable);
+      if (typeof fileHandle.queryPermission === 'function') {
+        const perm = await fileHandle.queryPermission({ mode: 'readwrite' });
+        if (perm !== 'granted' && typeof fileHandle.requestPermission === 'function') {
+          const reqPerm = await fileHandle.requestPermission({ mode: 'readwrite' });
+          if (reqPerm !== 'granted') {
+            throw new Error(
+              'Permissão de gravação negada para retomar o arquivo salvo. Clique em "Continuar" novamente e permita o acesso ao arquivo.'
+            );
+          }
+        }
+      }
+      const existingFile = await fileHandle.getFile();
+      if (existingFile.size < resumeCheckpoint.offset) {
+        throw new Error(
+          'O arquivo parcial salvo anteriormente foi movido, apagado ou alterado no disco. Descarte o checkpoint e inicie um novo backup.'
+        );
+      }
+      const writable = await fileHandle.createWritable({ keepExistingData: true });
+      await writable.truncate(resumeCheckpoint.offset);
+      await writable.seek(resumeCheckpoint.offset);
+      sink = new FileSystemWritableSink(writable, 8 * 1024 * 1024);
       usedDirectDisk = true;
+
+      writer = new StreamingZip64Writer(sink, {
+        initialOffset: resumeCheckpoint.offset,
+        initialEntries: resumeCheckpoint.entries,
+      });
+
+      const alreadyDone = new Set(resumeCheckpoint.entries.map((e) => e.path));
+      remainingFiles = plan.files.filter((f) => !alreadyDone.has(f.url.replace(/^\/+/, '')));
+      completed = resumeCheckpoint.entries.length;
+      bytesDownloaded = resumeCheckpoint.bytesDownloaded;
+      initialBytesDownloaded = bytesDownloaded;
+      totalCount = Math.max(plan.files.length + 2, completed + remainingFiles.length);
+      totalBytes = Math.max(resumeCheckpoint.totalBytes, plan.totalBytes);
     } catch (err) {
       if ((err as Error)?.name === 'AbortError') {
-        throw new DOMException('Salvamento cancelado pelo usuário.', 'AbortError');
+        throw new DOMException('Retomada cancelada pelo usuário.', 'AbortError');
       }
-      // Blocked in iframe or unsupported -> fall through to memory check
+      throw err;
     }
+  } else {
+    if (supportsFileSystemSavePicker()) {
+      try {
+        const picker = (window as unknown as {
+          showSaveFilePicker: (opts: unknown) => Promise<any>;
+        }).showSaveFilePicker;
+        fileHandle = await picker({
+          suggestedName: plan.filename,
+          types: [
+            {
+              description: 'Backup Único ZIP64 (naruto.jotagame.com)',
+              accept: { 'application/zip': ['.zip'] },
+            },
+          ],
+        });
+        const writable = await fileHandle.createWritable();
+        sink = new FileSystemWritableSink(writable, 8 * 1024 * 1024);
+        usedDirectDisk = true;
+      } catch (err) {
+        if ((err as Error)?.name === 'AbortError') {
+          throw new DOMException('Salvamento cancelado pelo usuário.', 'AbortError');
+        }
+        // Blocked in iframe or unsupported -> fall through to memory check
+      }
+    }
+
+    if (!sink) {
+      if (plan.totalBytes > 650 * 1024 * 1024) {
+        throw new Error(
+          `Este backup único tem ${(plan.totalBytes / (1024 * 1024 * 1024)).toFixed(
+            2
+          )} GB e precisa da gravação direta em disco (Chrome/Edge fora de iframe, como no GitHub Pages) ou do Script Gerador ZIP64 (.mjs) abaixo. Para testar aqui agora mesmo, selecione "Backup Teste Rápido (~260 MB)".`
+        );
+      }
+      sink = new MemoryBufferSink();
+    }
+
+    writer = new StreamingZip64Writer(sink);
+
+    // 1. Embed studio-snapshot.json & manifesto.json at root (exact game mirror metadata!)
+    const snapshot = await fetchBundledStudioSnapshot();
+    const snapBytes = strToU8(JSON.stringify(snapshot));
+    await writer.addFile('studio-snapshot.json', snapBytes);
+
+    const manifestPayload = {
+      versao: catalog.summary.manifestVersion,
+      origem: catalog.summary.sourceUrl,
+      build: catalog.summary.build,
+      geradoEm: new Date().toISOString(),
+      escopoBackup: effectiveScope,
+      arquivos: plan.files,
+    };
+    const manBytes = strToU8(JSON.stringify(manifestPayload));
+    await writer.addFile('manifesto.json', manBytes);
+
+    totalCount = plan.files.length + 2;
+    totalBytes = plan.totalBytes + snapBytes.byteLength + manBytes.byteLength;
+    completed = 2;
+    bytesDownloaded = snapBytes.byteLength + manBytes.byteLength;
+    initialBytesDownloaded = bytesDownloaded;
   }
 
-  if (!sink) {
-    if (plan.totalBytes > 650 * 1024 * 1024) {
-      throw new Error(
-        `Este backup único tem ${(plan.totalBytes / (1024 * 1024 * 1024)).toFixed(
-          2
-        )} GB e precisa da gravação direta em disco (Chrome/Edge fora de iframe, como no GitHub Pages) ou do Script Gerador ZIP64 (.mjs) abaixo. Para testar aqui agora mesmo, selecione "Backup Teste Rápido (~260 MB)".`
-      );
+  // Request Screen Wake Lock so PC/phone doesn't sleep mid-backup
+  let wakeLock: { release?: () => Promise<void> } | null = null;
+  try {
+    const nav = navigator as unknown as {
+      wakeLock?: { request: (type: 'screen') => Promise<{ release: () => Promise<void> }> };
+    };
+    if (nav.wakeLock) {
+      wakeLock = await nav.wakeLock.request('screen');
     }
-    sink = new MemoryBufferSink();
+  } catch {
+    // ignore unsupported or denied wake lock
   }
 
-  const writer = new StreamingZip64Writer(sink);
+  // Combine cancel signal + pause signal for network workers
+  const fetchCtrl = new AbortController();
+  const stopFetching = () => fetchCtrl.abort();
+  signal?.addEventListener('abort', stopFetching, { once: true });
+  pauseSignal?.addEventListener('abort', stopFetching, { once: true });
 
-  // 1. Embed studio-snapshot.json & manifesto.json at root (exact game mirror metadata!)
-  const snapshot = await fetchBundledStudioSnapshot();
-  const snapBytes = strToU8(JSON.stringify(snapshot));
-  await writer.addFile('studio-snapshot.json', snapBytes);
+  const sessionStart = performance.now();
+  let lastEmit = 0;
+  let speedWindowStart = sessionStart;
+  let speedWindowBytes = 0;
+  let smoothedSpeed = 0;
+  let isPausedOffline = false;
+  let currentFileLabel = resumeCheckpoint ? 'Retomando backup salvo...' : 'manifesto.json';
 
-  const manifestPayload = {
-    versao: catalog.summary.manifestVersion,
-    origem: catalog.summary.sourceUrl,
-    build: catalog.summary.build,
-    geradoEm: new Date().toISOString(),
-    escopoBackup: scope,
-    arquivos: plan.files,
+  const emitProgress = (force = false, stageLabel?: string) => {
+    const now = performance.now();
+    if (!force && now - lastEmit < 120) return;
+    lastEmit = now;
+
+    const winSec = (now - speedWindowStart) / 1000;
+    if (winSec >= 1.2) {
+      const instant = speedWindowBytes / winSec;
+      smoothedSpeed = smoothedSpeed > 0 ? smoothedSpeed * 0.65 + instant * 0.35 : instant;
+      speedWindowStart = now;
+      speedWindowBytes = 0;
+    } else if (smoothedSpeed === 0) {
+      const totalSec = Math.max(0.25, (now - sessionStart) / 1000);
+      smoothedSpeed = (bytesDownloaded - initialBytesDownloaded) / totalSec;
+    }
+
+    const remainingBytes = Math.max(0, totalBytes - bytesDownloaded);
+    const etaSeconds = smoothedSpeed > 2048 ? remainingBytes / smoothedSpeed : undefined;
+
+    onProgress?.({
+      completed,
+      total: totalCount,
+      bytesDownloaded,
+      totalBytes,
+      currentFile: currentFileLabel,
+      speedBytesPerSec: smoothedSpeed,
+      etaSeconds,
+      failedCount: failed,
+      pausedOffline: isPausedOffline,
+      stageLabel,
+    });
   };
-  const manBytes = strToU8(JSON.stringify(manifestPayload));
-  await writer.addFile('manifesto.json', manBytes);
 
-  const totalCount = plan.files.length + 2;
-  const totalBytes = plan.totalBytes + snapBytes.byteLength + manBytes.byteLength;
-  let completed = 2;
-  let bytesDownloaded = snapBytes.byteLength + manBytes.byteLength;
-  let failed = 0;
+  emitProgress(true, resumeCheckpoint ? 'Retomando de onde parou...' : 'Iniciando conexões paralelas...');
 
-  onProgress?.({
-    completed,
-    total: totalCount,
-    bytesDownloaded,
-    totalBytes,
-    currentFile: 'manifesto.json',
-  });
+  const failedItems: ManifestFile[] = [];
 
-  // 2. Stream files sequentially in small parallel prefetch batches (4 concurrent fetches, serialized writes)
-  const BATCH_SIZE = 6;
-  for (let i = 0; i < plan.files.length; i += BATCH_SIZE) {
+  // Pipelined continuous worker pool + bounded write queue (max 24 MB in RAM!)
+  const runDownloadPass = async (items: ManifestFile[], workerCount: number, timeoutMs: number, isRetryPass: boolean) => {
+    if (items.length === 0) return;
+    const MAX_QUEUE_BYTES = 24 * 1024 * 1024;
+    const writeQueue: Array<{ item: ManifestFile; data: Uint8Array }> = [];
+    let queuedBytes = 0;
+    let workersFinished = false;
+    let cursor = 0;
+    let consecutiveNetErrors = 0;
+    let writeFatalError: unknown = null;
+
+    let wakeWriter: (() => void) | null = null;
+    const queueNotFullWaiters: Array<() => void> = [];
+
+    const notifyWriter = () => {
+      if (wakeWriter) {
+        const fn = wakeWriter;
+        wakeWriter = null;
+        fn();
+      }
+    };
+
+    const notifyWorkersSpace = () => {
+      while (queueNotFullWaiters.length > 0 && queuedBytes < MAX_QUEUE_BYTES) {
+        const fn = queueNotFullWaiters.shift();
+        fn?.();
+      }
+    };
+
+    // Dedicated serialized writer coroutine — continuously drains into 8 MB buffered ZIP64 stream
+    const writerLoop = (async () => {
+      try {
+        while (!workersFinished || writeQueue.length > 0) {
+          if (signal?.aborted) break;
+          if (writeQueue.length === 0) {
+            await new Promise<void>((resolve) => {
+              wakeWriter = resolve;
+            });
+            continue;
+          }
+          const next = writeQueue.shift()!;
+          queuedBytes -= next.data.byteLength;
+          notifyWorkersSpace();
+
+          await writer.addFile(next.item.url, next.data);
+          bytesDownloaded += next.data.byteLength;
+          speedWindowBytes += next.data.byteLength;
+          completed++;
+          currentFileLabel = next.item.url.split('/').pop() || next.item.url;
+          emitProgress(false, isRetryPass ? 'Recuperando arquivos com falha...' : undefined);
+        }
+      } catch (err) {
+        writeFatalError = err;
+        fetchCtrl.abort();
+      } finally {
+        // Release any worker waiting on queue space
+        while (queueNotFullWaiters.length > 0) {
+          queueNotFullWaiters.shift()?.();
+        }
+      }
+    })();
+
+    const worker = async () => {
+      while (cursor < items.length) {
+        if (fetchCtrl.signal.aborted || writeFatalError) return;
+
+        // If browser went offline, wait seamlessly for reconnection instead of failing everything
+        if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+          isPausedOffline = true;
+          emitProgress(true, 'Sem internet — aguardando conexão voltar...');
+          await waitUntilOnlineOrAborted(signal, pauseSignal);
+          isPausedOffline = false;
+          if (fetchCtrl.signal.aborted) return;
+          emitProgress(true, 'Conexão restabelecida — continuando...');
+        }
+
+        // Backpressure so RAM never spikes even if internet > disk write speed
+        while (queuedBytes >= MAX_QUEUE_BYTES && !fetchCtrl.signal.aborted && !writeFatalError) {
+          await new Promise<void>((resolve) => {
+            queueNotFullWaiters.push(resolve);
+          });
+        }
+        if (fetchCtrl.signal.aborted || writeFatalError) return;
+
+        const idx = cursor++;
+        if (idx >= items.length) return;
+        const item = items[idx];
+
+        try {
+          const data = await fetchAssetBytesWithRetry(cdnBase, item.url, {
+            signal: fetchCtrl.signal,
+            timeoutMs,
+            maxRetries: 3,
+            noStore: true,
+          });
+          consecutiveNetErrors = 0;
+          writeQueue.push({ item, data });
+          queuedBytes += data.byteLength;
+          notifyWriter();
+        } catch (err) {
+          if (fetchCtrl.signal.aborted || (err as Error)?.name === 'AbortError') return;
+          consecutiveNetErrors++;
+          if (!isRetryPass) {
+            failedItems.push(item);
+          } else {
+            failed++;
+            completed++;
+            emitProgress();
+          }
+          // Brief breather if CDN temporarily rate-limits/drops a burst of connections
+          if (consecutiveNetErrors >= 12) {
+            consecutiveNetErrors = 0;
+            await new Promise((r) => window.setTimeout(r, 1500));
+          }
+        }
+      }
+    };
+
+    try {
+      const actualWorkers = Math.max(1, Math.min(workerCount, items.length));
+      await Promise.all(Array.from({ length: actualWorkers }, () => worker()));
+    } finally {
+      workersFinished = true;
+      notifyWriter();
+      await writerLoop;
+    }
+
+    if (writeFatalError) {
+      throw writeFatalError;
+    }
+  };
+
+  try {
+    await runDownloadPass(remainingFiles, Math.max(4, Math.min(48, concurrency)), 18000, false);
+
+    // Automatic recovery pass for any transient network failures before finalizing
+    if (
+      !signal?.aborted &&
+      !pauseSignal?.aborted &&
+      failedItems.length > 0 &&
+      failedItems.length <= 300
+    ) {
+      const toRetry = [...failedItems];
+      failedItems.length = 0;
+      emitProgress(true, `Tentando recuperar ${toRetry.length} arquivo(s) que oscilaram...`);
+      await runDownloadPass(toRetry, 8, 28000, true);
+    } else if (!pauseSignal?.aborted && !signal?.aborted && failedItems.length > 0) {
+      failed += failedItems.length;
+      completed += failedItems.length;
+    }
+
+    // Graceful Pause & Save Checkpoint to Disk + IndexedDB!
+    if (pauseSignal?.aborted && !signal?.aborted) {
+      if (usedDirectDisk && fileHandle) {
+        emitProgress(true, 'Salvando progresso no disco para continuar depois...');
+        const snap = await writer.flushAndSuspend();
+        await saveMirrorCheckpoint({
+          scope: effectiveScope,
+          filename: plan.filename,
+          handle: fileHandle,
+          offset: snap.offset,
+          entries: snap.entries,
+          failedUrls: failedItems.map((f) => f.url),
+          bytesDownloaded,
+          totalFiles: totalCount,
+          totalBytes,
+        });
+        return {
+          downloaded: snap.entries.length,
+          failed,
+          usedDirectDisk,
+          paused: true,
+        };
+      }
+      throw new DOMException('Backup pausado/cancelado.', 'AbortError');
+    }
+
     if (signal?.aborted) {
+      try {
+        await sink.close();
+      } catch {
+        // ignore close error on abort
+      }
       throw new DOMException('Backup cancelado pelo usuário.', 'AbortError');
     }
-    const batch = plan.files.slice(i, i + BATCH_SIZE);
-    const fetched = await Promise.all(
-      batch.map(async (item) => {
-        try {
-          const data = await fetchAssetBytes(cdnBase, item.url, signal);
-          return { item, data };
-        } catch {
-          return { item, data: null };
-        }
-      })
-    );
 
-    for (const { item, data } of fetched) {
-      if (signal?.aborted) {
-        throw new DOMException('Backup cancelado pelo usuário.', 'AbortError');
-      }
-      if (data) {
-        await writer.addFile(item.url, data);
-        bytesDownloaded += data.byteLength;
-      } else {
-        failed++;
-      }
-      completed++;
-      onProgress?.({
-        completed,
-        total: totalCount,
-        bytesDownloaded,
-        totalBytes,
-        currentFile: item.url.split('/').pop() || item.url,
-      });
+    emitProgress(true, 'Gravando índice ZIP64 Central Directory...');
+    await writer.finalize();
+    await clearMirrorCheckpoint();
+
+    if (sink instanceof MemoryBufferSink) {
+      triggerBlobDownload(sink.toBlob(), plan.filename);
+    }
+
+    return { downloaded: writer.getEntryCount(), failed, usedDirectDisk, paused: false };
+  } finally {
+    signal?.removeEventListener('abort', stopFetching);
+    pauseSignal?.removeEventListener('abort', stopFetching);
+    try {
+      await wakeLock?.release?.();
+    } catch {
+      // ignore
     }
   }
-
-  await writer.finalize();
-
-  if (sink instanceof MemoryBufferSink) {
-    triggerBlobDownload(sink.toBlob(), plan.filename);
-  }
-
-  return { downloaded: completed - failed, failed, usedDirectDisk };
 }
 
 export function downloadMirrorZip64ScriptFile(catalog: FullCatalog): void {
+  const cdn = catalog.summary.cdnBase.startsWith('http')
+    ? catalog.summary.cdnBase
+    : 'https://cdn.jotagame.com/';
   const script = `#!/usr/bin/env node
-// Shinobi Vault — Gerador de Backup ZIP64 Único (Estrutura EXATA de naruto.jotagame.com)
-// 100% compatível com leitura direta via Google Drive no Shinobi Vault!
-// Zero dependências externas (apenas Node.js 18+). Funciona em Windows, Mac, Linux e Android (Termux).
+// Shinobi Vault — Gerador Turbo & Retomável de Backup ZIP64 Único (naruto.jotagame.com)
+// - 32 conexões paralelas contínuas (máxima velocidade na sua internet!)
+// - Timeout individual por arquivo + 4 retentativas automáticas (NUNCA trava!)
+// - Buffer de escrita de 8 MB em disco + retomada automática via .checkpoint.json (Ctrl+C seguro!)
+// - Zero dependências externas (Node.js 18+). Funciona em Windows, Mac, Linux e Android (Termux).
 // Execute: node gerar_backup_unico_zip64.mjs
 import fs from 'node:fs';
 import path from 'node:path';
 
-const CDN = '${catalog.summary.cdnBase.startsWith('http') ? catalog.summary.cdnBase : 'https://cdn.jotagame.com/'}';
+const CDN = '${cdn}';
 const OUT_ZIP = path.resolve('./naruto_jotagame_backup_completo_100.zip');
-const CONCURRENCY = 10;
+const CKPT_FILE = OUT_ZIP + '.checkpoint.json';
+const CONCURRENCY = 32;
+const WRITE_BUFFER_SIZE = 8 * 1024 * 1024;
 
 const CRC_TABLE = new Uint32Array(256);
 for (let i = 0; i < 256; i++) {
@@ -1285,20 +1627,66 @@ function writeU64(view, pos, val) {
   view.setUint32(pos, val >>> 0, true);
   view.setUint32(pos + 4, Math.floor(val / 4294967296) >>> 0, true);
 }
+async function fetchWithRetry(url, maxRetries = 4) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(18000 + attempt * 8000) });
+      if (r.ok) return Buffer.from(await r.arrayBuffer());
+      if (r.status === 404 || r.status === 403) return null;
+    } catch {}
+    if (attempt < maxRetries) await new Promise((res) => setTimeout(res, 350 * (attempt + 1)));
+  }
+  return null;
+}
 
 async function main() {
-  console.log('1/3 Baixando configuração oficial de naruto.jotagame.com...');
-  const html = await (await fetch('https://naruto.jotagame.com/jogar?app=1')).text();
+  console.log('1/3 Baixando manifesto oficial de naruto.jotagame.com...');
+  const html = await (await fetch('https://naruto.jotagame.com/jogar?app=1', { signal: AbortSignal.timeout(20000) })).text();
   const rec = JSON.parse(html.match(/window\\.__VDF_RECURSOS__\\s*=\\s*(\\{[^;]+\\})/)[1]);
-  const manRes = await fetch(CDN + rec.manifesto);
-  const manData = await manRes.json();
+  const manData = await (await fetch(CDN + rec.manifesto, { signal: AbortSignal.timeout(30000) })).json();
   const arquivos = manData.arquivos || [];
-  console.log('2/3 Gravando ZIP64 único em:', OUT_ZIP, '(' + arquivos.length + ' arquivos)');
 
-  const fd = fs.openSync(OUT_ZIP, 'w');
   let offset = 0;
-  const entries = [];
+  let entries = [];
+  let resuming = false;
+  let fd;
 
+  if (fs.existsSync(CKPT_FILE) && fs.existsSync(OUT_ZIP)) {
+    const ck = JSON.parse(fs.readFileSync(CKPT_FILE, 'utf8'));
+    const st = fs.statSync(OUT_ZIP);
+    if (st.size >= ck.offset && Array.isArray(ck.entries)) {
+      offset = ck.offset;
+      entries = ck.entries;
+      resuming = true;
+      fd = fs.openSync(OUT_ZIP, 'r+');
+      fs.ftruncateSync(fd, offset);
+      console.log(\`Retomando checkpoint salvo: \${entries.length} arquivos (\${(offset / 1073741824).toFixed(2)} GB) já gravados!\`);
+    }
+  }
+  if (!resuming) {
+    fd = fs.openSync(OUT_ZIP, 'w');
+  }
+
+  let outBuf = Buffer.allocUnsafe(WRITE_BUFFER_SIZE);
+  let outUsed = 0;
+  let filePos = offset;
+  function flushOut() {
+    if (outUsed === 0) return;
+    fs.writeSync(fd, outBuf, 0, outUsed, filePos);
+    filePos += outUsed;
+    outUsed = 0;
+  }
+  function writeBuffered(chunk) {
+    if (chunk.length >= WRITE_BUFFER_SIZE) {
+      flushOut();
+      fs.writeSync(fd, chunk, 0, chunk.length, filePos);
+      filePos += chunk.length;
+      return;
+    }
+    if (outUsed + chunk.length > WRITE_BUFFER_SIZE) flushOut();
+    chunk.copy(outBuf, outUsed);
+    outUsed += chunk.length;
+  }
   function writeEntry(relPath, buf) {
     const clean = relPath.replace(/^\\/+/, '');
     const nameBytes = Buffer.from(clean, 'utf8');
@@ -1309,7 +1697,7 @@ async function main() {
     header.writeUInt32LE(0x04034b50, 0);
     header.writeUInt16LE(20, 4);
     header.writeUInt16LE(0x0800, 6);
-    header.writeUInt16LE(0, 8); // STORE (leitura instantânea via HTTP Range no Google Drive!)
+    header.writeUInt16LE(0, 8); // STORE
     header.writeUInt16LE(0, 10);
     header.writeUInt16LE(0x5421, 12);
     header.writeUInt32LE(crc, 14);
@@ -1318,44 +1706,81 @@ async function main() {
     header.writeUInt16LE(nameBytes.length, 26);
     header.writeUInt16LE(0, 28);
     nameBytes.copy(header, 30);
-    fs.writeSync(fd, header);
-    if (size > 0) fs.writeSync(fd, buf);
+    writeBuffered(header);
+    if (size > 0) writeBuffered(buf);
     offset += header.length + size;
-    entries.push({ nameBytes, crc, size, offset: entryOffset });
+    entries.push({ path: clean, crc, size, offset: entryOffset });
+  }
+  function saveCkpt() {
+    flushOut();
+    fs.writeFileSync(CKPT_FILE, JSON.stringify({ offset, entries }));
   }
 
-  writeEntry('manifesto.json', Buffer.from(JSON.stringify(manData), 'utf8'));
+  let stopRequested = false;
+  process.on('SIGINT', () => {
+    if (stopRequested) process.exit(1);
+    stopRequested = true;
+    console.log('\\nPausando com segurança e salvando checkpoint...');
+  });
 
-  let done = 0, failed = 0;
-  for (let i = 0; i < arquivos.length; i += CONCURRENCY) {
-    const batch = arquivos.slice(i, i + CONCURRENCY);
-    const results = await Promise.all(batch.map(async (f) => {
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          const r = await fetch(CDN + f.url);
-          if (r.ok) return { url: f.url, buf: Buffer.from(await r.arrayBuffer()) };
-        } catch {}
+  if (!resuming) {
+    writeEntry('manifesto.json', Buffer.from(JSON.stringify(manData), 'utf8'));
+  }
+
+  const doneSet = new Set(entries.map((e) => e.path));
+  const pending = arquivos.filter((f) => !doneSet.has(f.url.replace(/^\\/+/, '')));
+  console.log(\`2/3 Baixando \${pending.length} arquivos restantes com \${CONCURRENCY} conexões paralelas...\`);
+
+  let cursor = 0;
+  let sessionDone = 0;
+  let sessionBytes = 0;
+  let failed = 0;
+  const t0 = Date.now();
+  const totalBytesAll = arquivos.reduce((s, f) => s + (f.bytes || 0), 0);
+
+  async function worker() {
+    while (!stopRequested) {
+      const idx = cursor++;
+      if (idx >= pending.length) return;
+      const f = pending[idx];
+      const buf = await fetchWithRetry(CDN + f.url);
+      if (stopRequested) return;
+      if (buf) {
+        writeEntry(f.url, buf);
+        sessionBytes += buf.length;
+      } else {
+        failed++;
       }
-      return { url: f.url, buf: null };
-    }));
-    for (const r of results) {
-      if (r.buf) writeEntry(r.url, r.buf);
-      else failed++;
-      done++;
-      if (done % 250 === 0 || done === arquivos.length) {
-        const gb = (offset / (1024 ** 3)).toFixed(2);
-        console.log(\`Progresso: \${done}/\${arquivos.length} (\${gb} GB gravados | falhas: \${failed})\`);
+      sessionDone++;
+      if (sessionDone % 500 === 0) {
+        saveCkpt();
+        const sec = Math.max(0.5, (Date.now() - t0) / 1000);
+        const mbps = (sessionBytes / 1048576 / sec).toFixed(1);
+        const gb = (offset / 1073741824).toFixed(2);
+        const remBytes = Math.max(0, totalBytesAll - offset);
+        const etaMin = sessionBytes > 0 ? Math.round(remBytes / (sessionBytes / sec) / 60) : '?';
+        console.log(\`Progresso: \${entries.length}/\${arquivos.length} | \${gb} GB | \${mbps} MB/s | ETA ~\${etaMin} min | falhas: \${failed}\`);
       }
     }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, Math.max(1, pending.length)) }, () => worker()));
+
+  if (stopRequested) {
+    saveCkpt();
+    fs.closeSync(fd);
+    console.log(\`Checkpoint salvo em \${CKPT_FILE} (\${(offset / 1073741824).toFixed(2)} GB). Execute novamente para continuar exatamente de onde parou!\`);
+    return;
   }
 
   console.log('3/3 Finalizando índice ZIP64 Central Directory...');
   const cdStart = offset;
   let cdSize = 0;
   for (const e of entries) {
+    const nameBytes = Buffer.from(e.path, 'utf8');
     const needOff64 = e.offset >= 0xffffffff;
     const extraLen = needOff64 ? 12 : 0;
-    const recBuf = Buffer.alloc(46 + e.nameBytes.length + extraLen);
+    const recBuf = Buffer.alloc(46 + nameBytes.length + extraLen);
     const v = new DataView(recBuf.buffer, recBuf.byteOffset, recBuf.byteLength);
     v.setUint32(0, 0x02014b50, true);
     v.setUint16(4, 45, true);
@@ -1366,17 +1791,17 @@ async function main() {
     v.setUint32(16, e.crc, true);
     v.setUint32(20, e.size, true);
     v.setUint32(24, e.size, true);
-    v.setUint16(28, e.nameBytes.length, true);
+    v.setUint16(28, nameBytes.length, true);
     v.setUint16(30, extraLen, true);
     v.setUint32(42, needOff64 ? 0xffffffff : e.offset, true);
-    e.nameBytes.copy(recBuf, 46);
+    nameBytes.copy(recBuf, 46);
     if (needOff64) {
-      const ep = 46 + e.nameBytes.length;
+      const ep = 46 + nameBytes.length;
       v.setUint16(ep, 0x0001, true);
       v.setUint16(ep + 2, 8, true);
       writeU64(v, ep + 4, e.offset);
     }
-    fs.writeSync(fd, recBuf);
+    writeBuffered(recBuf);
     cdSize += recBuf.length;
   }
 
@@ -1395,7 +1820,7 @@ async function main() {
   zv.setUint32(56, 0x07064b50, true);
   writeU64(zv, 64, z64Off);
   zv.setUint32(72, 1, true);
-  fs.writeSync(fd, z64);
+  writeBuffered(z64);
 
   const eocd = Buffer.alloc(22);
   eocd.writeUInt32LE(0x06054b50, 0);
@@ -1403,9 +1828,11 @@ async function main() {
   eocd.writeUInt16LE(count >= 0xffff ? 0xffff : count, 10);
   eocd.writeUInt32LE(cdSize >= 0xffffffff ? 0xffffffff : cdSize, 12);
   eocd.writeUInt32LE(cdStart >= 0xffffffff ? 0xffffffff : cdStart, 16);
-  fs.writeSync(fd, eocd);
+  writeBuffered(eocd);
+  flushOut();
   fs.closeSync(fd);
-  console.log('Backup ZIP64 único concluído! Envie este arquivo para o Google Drive e cole o link no Shinobi Vault.');
+  if (fs.existsSync(CKPT_FILE)) fs.unlinkSync(CKPT_FILE);
+  console.log(\`Backup ZIP64 único concluído! (\${(offset / 1073741824).toFixed(2)} GB | \${entries.length} arquivos | falhas: \${failed})\`);
 }
 main();
 `;

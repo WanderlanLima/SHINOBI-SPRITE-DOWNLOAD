@@ -5,14 +5,18 @@ import {
   FileArchive,
   Film,
   Layers,
+  Move,
   Pause,
   Play,
   RotateCcw,
   Search,
+  Sparkles,
+  Volume2,
+  VolumeX,
   X,
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { loadImageWithFallback } from '../services/assetSource';
+import { loadImageWithFallback, resolvePlayableUrl } from '../services/assetSource';
 import {
   type FullCatalog,
   inspectAnim2DLive,
@@ -26,7 +30,7 @@ import type {
   SpineBundle,
   SpineInspectionResult,
 } from '../types';
-import { formatBytes } from '../utils/format';
+import { formatBytes, resolveCdnUrl } from '../utils/format';
 import { lockBodyScroll } from '../utils/scrollLock';
 import {
   exportAnim2DFramesZip,
@@ -37,8 +41,15 @@ import {
   type CompiledSpineSkeleton,
   compileSpineSkeleton,
   getAnimationDuration,
-  renderSpineAtTime,
+  renderSpineScene,
 } from '../utils/spineRenderer';
+import {
+  type LoadedVfxSpine,
+  buildSceneLayersAtTime,
+  computeSceneBoundsWithVfx,
+  loadVfxSpinesForTimeline,
+  resolveEffectiveAnimation,
+} from '../utils/spineVfxLoader';
 
 export type PlayerTarget =
   | { mode: 'spine'; bundle: SpineBundle; title?: string; initialAnim?: string }
@@ -66,6 +77,13 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
   const [playing, setPlaying] = useState(true);
   const [speed, setSpeed] = useState(1);
   const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [isDragging, setIsDragging] = useState(false);
+  const [showVfx, setShowVfx] = useState(true);
+  const [soundEnabled, setSoundEnabled] = useState(false);
+  const [activeVfxMap, setActiveVfxMap] = useState<Map<string, LoadedVfxSpine>>(new Map());
+  const [loadingVfx, setLoadingVfx] = useState(false);
+
   const [bgMode, setBgMode] = useState<BgMode>('checker');
   const [frameIndex, setFrameIndex] = useState(0);
   const [spineTime, setSpineTime] = useState(0);
@@ -77,6 +95,30 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const spineTimeRef = useRef(0);
   const lastRafRef = useRef<number | null>(null);
+  const dragOriginRef = useRef<{ clientX: number; clientY: number; panX: number; panY: number } | null>(null);
+  const vfxCacheRef = useRef<Map<string, LoadedVfxSpine | null>>(new Map());
+  const activeAudiosRef = useRef<Set<HTMLAudioElement>>(new Set());
+  const firedSoundsRef = useRef<Set<number>>(new Set());
+
+  const stopAllAudio = () => {
+    for (const aud of activeAudiosRef.current) {
+      try {
+        aud.pause();
+        aud.currentTime = 0;
+      } catch {
+        // ignore
+      }
+    }
+    activeAudiosRef.current.clear();
+  };
+
+  useEffect(() => {
+    if (!soundEnabled || !playing) stopAllAudio();
+  }, [soundEnabled, playing]);
+
+  useEffect(() => {
+    return () => stopAllAudio();
+  }, []);
 
   // Lock background page scroll while modal is open
   useEffect(() => {
@@ -102,14 +144,18 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
     setSpineData(null);
     setAnim2dData(null);
     setLoadedImages({});
+    setActiveVfxMap(new Map());
     setFrameIndex(0);
     setSpineTime(0);
     spineTimeRef.current = 0;
+    firedSoundsRef.current.clear();
+    stopAllAudio();
     setActiveSlotInfo('');
     setTrackSearch('');
     setViewTab('live');
     setPlaying(true);
     setZoom(1);
+    setPan({ x: 0, y: 0 });
 
     async function load() {
       try {
@@ -121,7 +167,8 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
           setSpineData(data);
           const requestedAnim =
             target!.mode === 'spine' && target!.initialAnim
-              ? data.animations.find(
+              ? data.animations.find((a) => a.name === target!.initialAnim)?.name ||
+                data.animations.find(
                   (a) => a.name.toLowerCase() === target!.initialAnim!.toLowerCase()
                 )?.name
               : undefined;
@@ -171,10 +218,60 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
     return compileSpineSkeleton(spineData.rawSkeleton, spineData.regions);
   }, [target?.mode, spineData]);
 
+  // Follow delegated tracks (`uniqueSkill` -> `UniqueSkill`, `skillAction` -> `skill`) and parse `@CMD`
+  const effectiveTrack = useMemo(() => {
+    if (target?.mode !== 'spine' || !spineData?.rawSkeleton || !selectedAnim) {
+      return { animName: selectedAnim, timeline: null };
+    }
+    return resolveEffectiveAnimation(spineData.rawSkeleton, selectedAnim);
+  }, [target?.mode, spineData, selectedAnim]);
+
+  const effectiveAnimName = effectiveTrack.animName || selectedAnim;
+  const activeTimeline = effectiveTrack.timeline;
+
   const currentSpineDuration = useMemo(() => {
-    if (!compiledSpine || !selectedAnim) return 0;
-    return getAnimationDuration(compiledSpine, selectedAnim);
-  }, [compiledSpine, selectedAnim]);
+    if (!compiledSpine || !effectiveAnimName) return 0;
+    return getAnimationDuration(compiledSpine, effectiveAnimName);
+  }, [compiledSpine, effectiveAnimName]);
+
+  // Preload `@CMD` `noe_*` VFX spines for the active animation track
+  useEffect(() => {
+    if (
+      target?.mode !== 'spine' ||
+      !activeTimeline ||
+      activeTimeline.vfx.length === 0 ||
+      !showVfx
+    ) {
+      setActiveVfxMap(new Map());
+      setLoadingVfx(false);
+      return;
+    }
+
+    let cancelled = false;
+    setLoadingVfx(true);
+    loadVfxSpinesForTimeline(activeTimeline.vfx, catalog, vfxCacheRef.current)
+      .then((map) => {
+        if (!cancelled) setActiveVfxMap(map);
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingVfx(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [target?.mode, activeTimeline, catalog, showVfx]);
+
+  const sceneBounds = useMemo(() => {
+    if (!compiledSpine || !effectiveAnimName) return null;
+    return computeSceneBoundsWithVfx(
+      compiledSpine,
+      effectiveAnimName,
+      activeTimeline,
+      activeVfxMap,
+      showVfx
+    );
+  }, [compiledSpine, effectiveAnimName, activeTimeline, activeVfxMap, showVfx]);
 
   // Compute extracted region/frame list (used for Anim2D playback, Frames tab, and fallback)
   const playableFrames = useMemo(() => {
@@ -296,7 +393,7 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
     const scale = fitScale * zoom;
 
     ctx.save();
-    ctx.translate(W / 2, H / 2);
+    ctx.translate(W / 2 + pan.x, H / 2 + pan.y);
     ctx.scale(scale, scale);
 
     if (frame.rotate) {
@@ -308,9 +405,37 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
     ctx.restore();
   };
 
-  // Real-time Spine 3.8 RAF loop
+  const renderCompositeSpineFrame = (ctx: CanvasRenderingContext2D, t: number) => {
+    if (!compiledSpine || !sceneBounds) return { drawnSlots: 0, activeLabels: [] as string[] };
+    const { layers, shakeX, shakeY, bgDimAlpha } = buildSceneLayersAtTime(
+      compiledSpine,
+      effectiveAnimName,
+      t,
+      loadedImages,
+      activeTimeline,
+      activeVfxMap,
+      showVfx
+    );
+    const res = renderSpineScene(ctx, layers, sceneBounds, zoom, {
+      panX: pan.x,
+      panY: pan.y,
+      shakeX,
+      shakeY,
+      bgDimAlpha,
+    });
+    if (res.drawnSlots === 0 && playableFrames.length > 0) {
+      const estIdx =
+        currentSpineDuration > 0
+          ? Math.floor((t / currentSpineDuration) * playableFrames.length) % playableFrames.length
+          : 0;
+      drawFallbackFrame(ctx, estIdx);
+    }
+    return res;
+  };
+
+  // Real-time Spine 3.8 RAF loop (with `@CMD` VFX + synchronized `@CMD` SFX + anti-clipping bounds)
   useEffect(() => {
-    if (target?.mode !== 'spine' || viewTab !== 'live' || !compiledSpine) return;
+    if (target?.mode !== 'spine' || viewTab !== 'live' || !compiledSpine || !sceneBounds) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
@@ -320,24 +445,34 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
     if (!hasImages) return;
 
     const duration = currentSpineDuration;
+    const cdnBase = catalog.summary.cdnBase;
     let rafId = 0;
     let lastUiSync = 0;
     lastRafRef.current = null;
 
-    const renderFrame = (t: number) => {
-      const res = renderSpineAtTime(ctx, compiledSpine, selectedAnim, t, loadedImages, zoom);
-      if (res.drawnSlots === 0 && playableFrames.length > 0) {
-        const estIdx =
-          duration > 0
-            ? Math.floor((t / duration) * playableFrames.length) % playableFrames.length
-            : 0;
-        drawFallbackFrame(ctx, estIdx);
+    const triggerDueSounds = (t: number) => {
+      if (!soundEnabled || !activeTimeline) return;
+      for (let i = 0; i < activeTimeline.sounds.length; i++) {
+        if (firedSoundsRef.current.has(i)) continue;
+        const cue = activeTimeline.sounds[i];
+        if (t >= cue.time) {
+          firedSoundsRef.current.add(i);
+          resolvePlayableUrl(resolveCdnUrl(cdnBase, cue.assetUrl)).then((playable) => {
+            if (!playable || activeAudiosRef.current.size >= 5) return;
+            const aud = new Audio(playable);
+            aud.volume = 0.55;
+            activeAudiosRef.current.add(aud);
+            const cleanup = () => activeAudiosRef.current.delete(aud);
+            aud.addEventListener('ended', cleanup, { once: true });
+            aud.addEventListener('error', cleanup, { once: true });
+            aud.play().catch(cleanup);
+          });
+        }
       }
-      return res;
     };
 
     // Always draw immediately for current time
-    const initRes = renderFrame(spineTimeRef.current);
+    const initRes = renderCompositeSpineFrame(ctx, spineTimeRef.current);
     if (initRes.activeLabels.length > 0) {
       setActiveSlotInfo(initRes.activeLabels.slice(0, 3).join(' · '));
     }
@@ -356,10 +491,12 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
       let nextT = spineTimeRef.current + dt;
       if (duration > 0 && nextT >= duration) {
         nextT = nextT % duration;
+        firedSoundsRef.current.clear();
       }
       spineTimeRef.current = nextT;
 
-      const res = renderFrame(nextT);
+      triggerDueSounds(nextT);
+      const res = renderCompositeSpineFrame(ctx, nextT);
 
       // Throttle React state updates to ~20fps so scrubber stays smooth without overhead
       if (now - lastUiSync > 50) {
@@ -382,13 +519,20 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
     target?.mode,
     viewTab,
     compiledSpine,
-    selectedAnim,
+    effectiveAnimName,
+    activeTimeline,
+    activeVfxMap,
+    showVfx,
+    soundEnabled,
+    sceneBounds,
     currentSpineDuration,
     loadedImages,
     playing,
     speed,
     zoom,
+    pan,
     playableFrames,
+    catalog.summary.cdnBase,
   ]);
 
   // Anim2D playback loop
@@ -411,13 +555,54 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     drawFallbackFrame(ctx, frameIndex);
-  }, [target?.mode, playableFrames, frameIndex, loadedImages, zoom, viewTab]);
+  }, [target?.mode, playableFrames, frameIndex, loadedImages, zoom, pan, viewTab]);
 
   if (!target) return null;
 
   const title = target.title || target.bundle.name;
   const isSpineMode = target.mode === 'spine';
   const loadedImageCount = Object.keys(loadedImages).length;
+  const hasVfxCmds = Boolean(activeTimeline && activeTimeline.vfx.length > 0);
+  const hasSoundCmds = Boolean(activeTimeline && activeTimeline.sounds.length > 0);
+  const hasCameraOffset = zoom !== 1 || pan.x !== 0 || pan.y !== 0;
+
+  const handleStagePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    setIsDragging(true);
+    dragOriginRef.current = {
+      clientX: e.clientX,
+      clientY: e.clientY,
+      panX: pan.x,
+      panY: pan.y,
+    };
+  };
+
+  const handleStagePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragOriginRef.current) return;
+    const canvas = canvasRef.current;
+    const rect = canvas?.getBoundingClientRect();
+    const scaleX = canvas && rect && rect.width > 0 ? canvas.width / rect.width : 1;
+    const scaleY = canvas && rect && rect.height > 0 ? canvas.height / rect.height : 1;
+    const dx = (e.clientX - dragOriginRef.current.clientX) * scaleX;
+    const dy = (e.clientY - dragOriginRef.current.clientY) * scaleY;
+    setPan({
+      x: Math.max(-420, Math.min(420, dragOriginRef.current.panX + dx)),
+      y: Math.max(-320, Math.min(320, dragOriginRef.current.panY + dy)),
+    });
+  };
+
+  const handleStagePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (dragOriginRef.current) {
+      dragOriginRef.current = null;
+      setIsDragging(false);
+      try {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      } catch {
+        // ignore
+      }
+    }
+  };
 
   const handleStep = (dir: -1 | 1) => {
     setPlaying(false);
@@ -431,7 +616,7 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
       const canvas = canvasRef.current;
       const ctx = canvas?.getContext('2d');
       if (ctx) {
-        renderSpineAtTime(ctx, compiledSpine, selectedAnim, next, loadedImages, zoom);
+        renderCompositeSpineFrame(ctx, next);
       }
     } else if (playableFrames.length > 0) {
       setFrameIndex((i) => (i + dir + playableFrames.length) % playableFrames.length);
@@ -445,7 +630,7 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
     if (compiledSpine && canvasRef.current) {
       const ctx = canvasRef.current.getContext('2d');
       if (ctx) {
-        renderSpineAtTime(ctx, compiledSpine, selectedAnim, nextSec, loadedImages, zoom);
+        renderCompositeSpineFrame(ctx, nextSec);
       }
     }
   };
@@ -453,8 +638,11 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
   const handleSelectTrack = (animName: string) => {
     setSelectedAnim(animName);
     spineTimeRef.current = 0;
+    firedSoundsRef.current.clear();
+    stopAllAudio();
     setSpineTime(0);
     setFrameIndex(0);
+    setPan({ x: 0, y: 0 });
     setPlaying(true);
     setViewTab('live');
   };
@@ -497,7 +685,7 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
       if (isSpineMode && compiledSpine) {
         await exportSpineAnimationFramesZip({
           bundleName: target.bundle.name,
-          animName: selectedAnim || 'pose',
+          animName: effectiveAnimName || selectedAnim || 'pose',
           compiled: compiledSpine,
           loadedImages,
           zoom,
@@ -645,7 +833,41 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
           </div>
 
           {viewTab === 'live' && (
-            <div className="flex items-center gap-2.5 text-xs text-[#9CA5B9] shrink-0">
+            <div className="flex items-center gap-2 text-xs text-[#9CA5B9] shrink-0">
+              {isSpineMode && hasVfxCmds && (
+                <button
+                  type="button"
+                  onClick={() => setShowVfx((v) => !v)}
+                  title="Ativar ou ocultar efeitos VFX (@CMD) da habilidade"
+                  className={`inline-flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium transition-colors whitespace-nowrap ${
+                    showVfx
+                      ? 'bg-[#EA580C]/20 text-[#FB923C] border border-[#EA580C]/40'
+                      : 'bg-[#161A25] text-[#8E97AB] hover:text-white border border-transparent'
+                  }`}
+                >
+                  <Sparkles className="w-3 h-3" />
+                  <span>
+                    VFX{loadingVfx ? '...' : activeVfxMap.size > 0 ? ` (${activeVfxMap.size})` : ''}
+                  </span>
+                </button>
+              )}
+
+              {isSpineMode && hasSoundCmds && (
+                <button
+                  type="button"
+                  onClick={() => setSoundEnabled((s) => !s)}
+                  title={soundEnabled ? 'Silenciar efeitos sonoros @CMD' : 'Ativar efeitos sonoros @CMD'}
+                  className={`inline-flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium transition-colors whitespace-nowrap ${
+                    soundEnabled
+                      ? 'bg-[#EA580C]/20 text-[#FB923C] border border-[#EA580C]/40'
+                      : 'bg-[#161A25] text-[#8E97AB] hover:text-white border border-transparent'
+                  }`}
+                >
+                  {soundEnabled ? <Volume2 className="w-3 h-3" /> : <VolumeX className="w-3 h-3" />}
+                  <span className="hidden md:inline">Som</span>
+                </button>
+              )}
+
               <div className="flex items-center gap-0.5 p-0.5 bg-[#161A25] rounded-md">
                 {(
                   [
@@ -670,9 +892,9 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
                 <span>Zoom</span>
                 <input
                   type="range"
-                  min="0.4"
-                  max="2.2"
-                  step="0.1"
+                  min="0.3"
+                  max="2.5"
+                  step="0.05"
                   value={zoom}
                   onChange={(e) => setZoom(parseFloat(e.target.value))}
                   className="w-20 accent-[#EA580C]"
@@ -681,6 +903,21 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
                   {Math.round(zoom * 100)}%
                 </span>
               </label>
+
+              {hasCameraOffset && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setZoom(1);
+                    setPan({ x: 0, y: 0 });
+                  }}
+                  title="Centralizar câmera"
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium bg-[#1D2230] hover:bg-[#2A3248] text-white whitespace-nowrap"
+                >
+                  <Move className="w-3 h-3" />
+                  <span className="hidden md:inline">Centralizar</span>
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -706,18 +943,26 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
             ) : viewTab === 'live' ? (
               <>
                 <div
-                  className={`flex-1 min-h-0 relative flex items-center justify-center overflow-hidden ${stageBgClass}`}
+                  onPointerDown={handleStagePointerDown}
+                  onPointerMove={handleStagePointerMove}
+                  onPointerUp={handleStagePointerUp}
+                  onPointerCancel={handleStagePointerUp}
+                  className={`flex-1 min-h-0 relative flex items-center justify-center overflow-hidden select-none touch-none ${
+                    isDragging ? 'cursor-grabbing' : 'cursor-grab'
+                  } ${stageBgClass}`}
                 >
                   <canvas
                     ref={canvasRef}
-                    width={720}
-                    height={460}
-                    className="w-full h-full object-contain"
+                    width={840}
+                    height={540}
+                    className="w-full h-full object-contain pointer-events-none"
                   />
 
                   {selectedAnim && isSpineMode && (
-                    <div className="absolute top-2.5 left-2.5 px-2.5 py-1 rounded bg-[#0B0D12]/85 border border-[#222736] text-[11px] font-mono text-white max-w-[75%] truncate">
-                      {selectedAnim}
+                    <div className="absolute top-2.5 left-2.5 px-2.5 py-1 rounded bg-[#0B0D12]/85 border border-[#222736] text-[11px] font-mono text-white max-w-[75%] truncate pointer-events-none">
+                      {effectiveAnimName !== selectedAnim
+                        ? `${selectedAnim} → ${effectiveAnimName}`
+                        : selectedAnim}
                     </div>
                   )}
 
@@ -733,10 +978,13 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
                         {spineTime.toFixed(2)}s / {currentSpineDuration.toFixed(2)}s
                         {activeSlotInfo ? ` · ${activeSlotInfo}` : ''}
                       </div>
+                      <div className="hidden sm:block px-2 py-0.5 rounded bg-[#0B0D12]/75 border border-[#222736] text-[10px] text-[#8E97AB] shrink-0">
+                        Arraste para mover a câmera
+                      </div>
                     </div>
                   ) : (
                     playableFrames.length > 0 && (
-                      <div className="absolute bottom-2.5 left-2.5 px-2.5 py-1 rounded bg-[#0B0D12]/85 border border-[#222736] text-[11px] font-mono tabular-nums text-[#C9D1E1]">
+                      <div className="absolute bottom-2.5 left-2.5 px-2.5 py-1 rounded bg-[#0B0D12]/85 border border-[#222736] text-[11px] font-mono tabular-nums text-[#C9D1E1] pointer-events-none">
                         Frame {(frameIndex % playableFrames.length) + 1}/{playableFrames.length} ·{' '}
                         {playableFrames[frameIndex % playableFrames.length]?.label}
                       </div>
@@ -771,11 +1019,14 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
                     <button
                       onClick={() => {
                         spineTimeRef.current = 0;
+                        firedSoundsRef.current.clear();
+                        stopAllAudio();
                         setSpineTime(0);
                         setFrameIndex(0);
                         setZoom(1);
+                        setPan({ x: 0, y: 0 });
                       }}
-                      aria-label="Reiniciar"
+                      aria-label="Reiniciar e centralizar"
                       className="p-1.5 text-[#C9D1E1] bg-[#181C28] hover:bg-[#242A3B] rounded-lg"
                     >
                       <RotateCcw className="w-3.5 h-3.5" />

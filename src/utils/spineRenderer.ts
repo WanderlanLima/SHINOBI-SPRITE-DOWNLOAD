@@ -42,6 +42,13 @@ interface WorldTransform {
   wy: number;
 }
 
+export interface SpineBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 export interface CompiledSpineSkeleton {
   bones: BoneSetup[];
   boneIndexByName: Map<string, number>;
@@ -49,8 +56,19 @@ export interface CompiledSpineSkeleton {
   attachments: Map<string, Map<string, RegionAttachment>>;
   regions: Map<string, SpineAtlasRegion>;
   animations: Record<string, any>;
-  bounds: { x: number; y: number; width: number; height: number };
+  bounds: SpineBounds;
   fps: number;
+  /** Cache de envelopes de bounding-box por faixa de animação (impede corte em pulos/avanços) */
+  animBoundsCache: Map<string, SpineBounds>;
+}
+
+interface DrawItem {
+  slot: SlotSetup;
+  bone: WorldTransform;
+  att: RegionAttachment;
+  region: SpineAtlasRegion;
+  img: HTMLImageElement | null;
+  alpha: number;
 }
 
 function parseHexColor(hex?: string): [number, number, number, number] {
@@ -118,7 +136,12 @@ export function compileSpineSkeleton(
         if (slotMap.has(attName)) continue;
         slotMap.set(attName, {
           name: attName,
-          path: typeof rawAtt.path === 'string' ? rawAtt.path : typeof rawAtt.name === 'string' ? rawAtt.name : attName,
+          path:
+            typeof rawAtt.path === 'string'
+              ? rawAtt.path
+              : typeof rawAtt.name === 'string'
+              ? rawAtt.name
+              : attName,
           x: typeof rawAtt.x === 'number' ? rawAtt.x : 0,
           y: typeof rawAtt.y === 'number' ? rawAtt.y : 0,
           rotation: typeof rawAtt.rotation === 'number' ? rawAtt.rotation : 0,
@@ -163,6 +186,7 @@ export function compileSpineSkeleton(
     animations: (rawSkeleton.animations || {}) as Record<string, any>,
     bounds: { x, y, width, height },
     fps,
+    animBoundsCache: new Map(),
   };
 }
 
@@ -227,28 +251,18 @@ function sampleAngleDelta(a0: number, a1: number, alpha: number): number {
   return a0 + diff * alpha;
 }
 
-export interface RenderSpineResult {
-  drawnSlots: number;
-  activeLabels: string[];
-}
+const DEG = Math.PI / 180;
 
-export function renderSpineAtTime(
-  ctx: CanvasRenderingContext2D,
+function evaluatePose(
   compiled: CompiledSpineSkeleton,
   animName: string,
   time: number,
-  loadedImages: Record<string, HTMLImageElement>,
-  zoom: number
-): RenderSpineResult {
-  const W = ctx.canvas.width;
-  const H = ctx.canvas.height;
-  ctx.clearRect(0, 0, W, H);
-
+  loadedImages?: Record<string, HTMLImageElement>
+): { drawItems: DrawItem[]; activeLabels: string[] } {
   const anim = compiled.animations[animName] || null;
   const bonesAnim = (anim?.bones || {}) as Record<string, any>;
   const slotsAnim = (anim?.slots || {}) as Record<string, any>;
 
-  // 1. Evaluate local bone transforms
   const localBones = compiled.bones.map((b) => {
     let x = b.x;
     let y = b.y;
@@ -305,9 +319,7 @@ export function renderSpineAtTime(
     return { x, y, rotation, scaleX, scaleY, shearX, shearY };
   });
 
-  // 2. Compute world bone matrices in Spine Y-up space
   const worldBones: WorldTransform[] = new Array(compiled.bones.length);
-  const DEG = Math.PI / 180;
 
   for (let i = 0; i < compiled.bones.length; i++) {
     const setup = compiled.bones[i];
@@ -334,16 +346,6 @@ export function renderSpineAtTime(
     }
   }
 
-  // 3. Collect visible drawable slots and compute dynamic bounding box
-  interface DrawItem {
-    slot: SlotSetup;
-    bone: WorldTransform;
-    att: RegionAttachment;
-    region: SpineAtlasRegion;
-    img: HTMLImageElement;
-    alpha: number;
-  }
-
   const drawItems: DrawItem[] = [];
   const activeLabels: string[] = [];
 
@@ -352,7 +354,6 @@ export function renderSpineAtTime(
     let attName = slot.attachment;
 
     if (sAnim && Array.isArray(sAnim.attachment) && sAnim.attachment.length > 0) {
-      // Attachment timelines are stepped; before first keyframe, setup pose applies
       const firstT = typeof sAnim.attachment[0]?.time === 'number' ? sAnim.attachment[0].time : 0;
       if (time >= firstT) {
         let chosen = sAnim.attachment[0];
@@ -386,8 +387,8 @@ export function renderSpineAtTime(
       compiled.regions.get(attName);
     if (!region) continue;
 
-    const img = loadedImages[region.page];
-    if (!img) continue;
+    const img = loadedImages ? loadedImages[region.page] || null : null;
+    if (loadedImages && !img) continue;
 
     const bone = worldBones[slot.boneIndex] || { a: 1, b: 0, c: 0, d: 1, wx: 0, wy: 0 };
     const effectiveAtt: RegionAttachment = att || {
@@ -414,38 +415,171 @@ export function renderSpineAtTime(
     activeLabels.push(`${slot.name}:${attName}`);
   }
 
-  if (drawItems.length === 0) {
-    return { drawnSlots: 0, activeLabels };
+  return { drawItems, activeLabels };
+}
+
+function accumulateDrawItemBounds(
+  item: DrawItem,
+  ext: { minX: number; minY: number; maxX: number; maxY: number; count: number },
+  offsetX = 0,
+  offsetY = 0
+): void {
+  const { bone, att, region } = item;
+  const origW = region.origWidth || region.width;
+  const origH = region.origHeight || region.height;
+  const targetW = att.width || origW;
+  const targetH = att.height || origH;
+  const sxScale = origW > 0 ? targetW / origW : 1;
+  const syScale = origH > 0 ? targetH / origH : 1;
+
+  const trimCenterX = (region.offsetX + region.width / 2 - origW / 2) * sxScale;
+  const trimCenterY = (region.offsetY + region.height / 2 - origH / 2) * syScale;
+  const halfW = (region.width * sxScale) / 2;
+  const halfH = (region.height * syScale) / 2;
+
+  const cosR = Math.cos(att.rotation * DEG);
+  const sinR = Math.sin(att.rotation * DEG);
+
+  const corners: Array<[number, number]> = [
+    [trimCenterX - halfW, trimCenterY - halfH],
+    [trimCenterX + halfW, trimCenterY - halfH],
+    [trimCenterX + halfW, trimCenterY + halfH],
+    [trimCenterX - halfW, trimCenterY + halfH],
+  ];
+
+  for (const [cx, cy] of corners) {
+    // Attachment scale -> rotate -> translate
+    const sx = cx * att.scaleX;
+    const sy = cy * att.scaleY;
+    const lx = att.x + sx * cosR - sy * sinR;
+    const ly = att.y + sx * sinR + sy * cosR;
+    // Bone world transform
+    const wx = bone.a * lx + bone.b * ly + bone.wx + offsetX;
+    const wy = bone.c * lx + bone.d * ly + bone.wy + offsetY;
+    if (!Number.isFinite(wx) || !Number.isFinite(wy)) continue;
+    if (wx < ext.minX) ext.minX = wx;
+    if (wy < ext.minY) ext.minY = wy;
+    if (wx > ext.maxX) ext.maxX = wx;
+    if (wy > ext.maxY) ext.maxY = wy;
+    ext.count++;
+  }
+}
+
+/**
+ * Calcula o envelope real (bounding box) de uma animação inteira amostrando todos os
+ * attachments ao longo da linha do tempo.
+ * Impede que pulos, avanços laterais e ataques largos sejam cortados nas bordas do canvas!
+ */
+export function computeAnimationBounds(
+  compiled: CompiledSpineSkeleton,
+  animName: string
+): SpineBounds {
+  const key = animName || '__setup__';
+  const cached = compiled.animBoundsCache.get(key);
+  if (cached) return cached;
+
+  const duration = animName ? getAnimationDuration(compiled, animName) : 0;
+  const sampleCount = duration > 0 ? Math.min(48, Math.max(18, Math.ceil(duration * 16))) : 1;
+
+  const ext = {
+    minX: Infinity,
+    minY: Infinity,
+    maxX: -Infinity,
+    maxY: -Infinity,
+    count: 0,
+  };
+
+  for (let s = 0; s <= sampleCount; s++) {
+    const t = sampleCount > 0 ? (duration * s) / sampleCount : 0;
+    const { drawItems } = evaluatePose(compiled, animName, t);
+    for (const item of drawItems) {
+      accumulateDrawItemBounds(item, ext);
+    }
   }
 
-  // Fit skeleton bounds neatly inside canvas (use skeleton setup bounds + slight padding)
-  const bnd = compiled.bounds;
-  const refW = Math.max(120, bnd.width);
-  const refH = Math.max(120, bnd.height);
-  const centerX = bnd.x + bnd.width / 2;
-  const centerY = bnd.y + bnd.height / 2;
+  let bounds: SpineBounds;
+  if (ext.count > 0 && Number.isFinite(ext.minX) && Number.isFinite(ext.maxX)) {
+    // Sempre inclui também a pose base (setup) para manter estabilidade visual
+    const minX = Math.min(ext.minX, compiled.bounds.x);
+    const minY = Math.min(ext.minY, compiled.bounds.y);
+    const maxX = Math.max(ext.maxX, compiled.bounds.x + compiled.bounds.width);
+    const maxY = Math.max(ext.maxY, compiled.bounds.y + compiled.bounds.height);
 
-  const fitScale = Math.min((W * 0.72) / refW, (H * 0.74) / refH, 2.4);
-  const finalScale = fitScale * zoom;
+    // Limita outliers extremos (> 2600px) para evitar zoom microscópico em efeitos de tela gigante
+    const clampedMinX = Math.max(minX, -1400);
+    const clampedMaxX = Math.min(maxX, 1400);
+    const clampedMinY = Math.max(minY, -900);
+    const clampedMaxY = Math.min(maxY, 1400);
 
-  ctx.save();
-  // Map Spine (centerX, centerY) with Y-up to Canvas (W/2, H/2) with Y-down
-  ctx.translate(W / 2, H / 2);
-  ctx.scale(finalScale, -finalScale);
-  ctx.translate(-centerX, -centerY);
+    const w = Math.max(120, clampedMaxX - clampedMinX);
+    const h = Math.max(120, clampedMaxY - clampedMinY);
+    const padX = Math.max(24, w * 0.08);
+    const padY = Math.max(24, h * 0.08);
 
+    bounds = {
+      x: clampedMinX - padX,
+      y: clampedMinY - padY,
+      width: w + padX * 2,
+      height: h + padY * 2,
+    };
+  } else {
+    bounds = { ...compiled.bounds };
+  }
+
+  compiled.animBoundsCache.set(key, bounds);
+  return bounds;
+}
+
+export function mergeSpineBounds(
+  base: SpineBounds,
+  extra: SpineBounds,
+  maxExpansionRatio = 2.6
+): SpineBounds {
+  // Evita que um efeito de fundo gigante encolha o ninja para um ponto minúsculo
+  const baseCx = base.x + base.width / 2;
+  const baseCy = base.y + base.height / 2;
+  const maxHalfW = Math.max(base.width * maxExpansionRatio * 0.6, 460);
+  const maxHalfH = Math.max(base.height * maxExpansionRatio * 0.6, 360);
+
+  const clampedExtraMinX = Math.max(extra.x, baseCx - maxHalfW);
+  const clampedExtraMaxX = Math.min(extra.x + extra.width, baseCx + maxHalfW);
+  const clampedExtraMinY = Math.max(extra.y, baseCy - maxHalfH);
+  const clampedExtraMaxY = Math.min(extra.y + extra.height, baseCy + maxHalfH);
+
+  const minX = Math.min(base.x, clampedExtraMinX);
+  const minY = Math.min(base.y, clampedExtraMinY);
+  const maxX = Math.max(base.x + base.width, clampedExtraMaxX);
+  const maxY = Math.max(base.y + base.height, clampedExtraMaxY);
+
+  return {
+    x: minX,
+    y: minY,
+    width: Math.max(120, maxX - minX),
+    height: Math.max(120, maxY - minY),
+  };
+}
+
+function drawItemsInCurrentSpace(
+  ctx: CanvasRenderingContext2D,
+  drawItems: DrawItem[],
+  offsetX = 0,
+  offsetY = 0
+): void {
   for (const item of drawItems) {
     const { bone, att, region, img, alpha, slot } = item;
+    if (!img) continue;
     ctx.save();
     ctx.globalAlpha = alpha;
     if (slot.blend === 'additive') {
       ctx.globalCompositeOperation = 'lighter';
     }
 
-    // Apply bone world transform: [a, c, b, d, wx, wy]
+    if (offsetX !== 0 || offsetY !== 0) {
+      ctx.translate(offsetX, offsetY);
+    }
+
     ctx.transform(bone.a, bone.c, bone.b, bone.d, bone.wx, bone.wy);
 
-    // Apply attachment local transform
     ctx.translate(att.x, att.y);
     if (att.rotation !== 0) {
       ctx.rotate(att.rotation * DEG);
@@ -454,7 +588,6 @@ export function renderSpineAtTime(
       ctx.scale(att.scaleX, att.scaleY);
     }
 
-    // Account for atlas whitespace trimming (origWidth/origHeight + offsetX/offsetY)
     const origW = region.origWidth || region.width;
     const origH = region.origHeight || region.height;
     const targetW = att.width || origW;
@@ -463,20 +596,16 @@ export function renderSpineAtTime(
     const sxScale = origW > 0 ? targetW / origW : 1;
     const syScale = origH > 0 ? targetH / origH : 1;
 
-    // Region center relative to untrimmed original center in Spine Y-up coordinates
     const trimCenterX = (region.offsetX + region.width / 2 - origW / 2) * sxScale;
     const trimCenterY = (region.offsetY + region.height / 2 - origH / 2) * syScale;
 
     ctx.translate(trimCenterX, trimCenterY);
-    // Flip Y back to image-down for canvas drawImage
     ctx.scale(1, -1);
 
     const drawW = region.width * sxScale;
     const drawH = region.height * syScale;
 
     if (region.rotate) {
-      // Spine atlas `rotate: true` stores the region rotated 90° CCW in texture space
-      // (srcW = region.height, srcH = region.width); rotating +90° CW restores it upright.
       ctx.rotate(Math.PI / 2);
       ctx.drawImage(
         img,
@@ -505,7 +634,120 @@ export function renderSpineAtTime(
 
     ctx.restore();
   }
+}
+
+export interface RenderSpineResult {
+  drawnSlots: number;
+  activeLabels: string[];
+}
+
+export interface SpineSceneLayer {
+  compiled: CompiledSpineSkeleton;
+  animName: string;
+  time: number;
+  images: Record<string, HTMLImageElement>;
+  zOrder: 'bg' | 'char' | 'fg';
+  offsetX?: number;
+  offsetY?: number;
+}
+
+export interface RenderSpineOptions {
+  panX?: number;
+  panY?: number;
+  shakeX?: number;
+  shakeY?: number;
+  bgDimAlpha?: number;
+  overrideBounds?: SpineBounds;
+}
+
+/**
+ * Renderiza múltiplas camadas Spine (Efeitos VFX de fundo + Ninja + Efeitos VFX da frente)
+ * no mesmo espaço de coordenadas do jogo, com enquadramento dinâmico anti-corte!
+ */
+export function renderSpineScene(
+  ctx: CanvasRenderingContext2D,
+  layers: SpineSceneLayer[],
+  cameraBounds: SpineBounds,
+  zoom: number,
+  options: RenderSpineOptions = {}
+): RenderSpineResult {
+  const W = ctx.canvas.width;
+  const H = ctx.canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  if (options.bgDimAlpha && options.bgDimAlpha > 0.01) {
+    ctx.save();
+    ctx.fillStyle = `rgba(0, 0, 0, ${Math.min(0.65, options.bgDimAlpha)})`;
+    ctx.fillRect(0, 0, W, H);
+    ctx.restore();
+  }
+
+  const refW = Math.max(120, cameraBounds.width);
+  const refH = Math.max(120, cameraBounds.height);
+  const centerX = cameraBounds.x + cameraBounds.width / 2;
+  const centerY = cameraBounds.y + cameraBounds.height / 2;
+
+  const fitScale = Math.min((W * 0.86) / refW, (H * 0.86) / refH, 2.2);
+  const finalScale = fitScale * zoom;
+
+  const panX = options.panX || 0;
+  const panY = options.panY || 0;
+  const shakeX = options.shakeX || 0;
+  const shakeY = options.shakeY || 0;
+
+  let drawnSlots = 0;
+  const activeLabels: string[] = [];
+
+  const orderRank = { bg: 0, char: 1, fg: 2 };
+  const sortedLayers = [...layers].sort((a, b) => orderRank[a.zOrder] - orderRank[b.zOrder]);
+
+  ctx.save();
+  ctx.translate(W / 2 + panX + shakeX, H / 2 + panY + shakeY);
+  ctx.scale(finalScale, -finalScale);
+  ctx.translate(-centerX, -centerY);
+
+  for (const layer of sortedLayers) {
+    const { drawItems, activeLabels: labels } = evaluatePose(
+      layer.compiled,
+      layer.animName,
+      layer.time,
+      layer.images
+    );
+    if (drawItems.length === 0) continue;
+    drawItemsInCurrentSpace(ctx, drawItems, layer.offsetX || 0, layer.offsetY || 0);
+    drawnSlots += drawItems.length;
+    if (layer.zOrder === 'char') {
+      activeLabels.push(...labels);
+    }
+  }
 
   ctx.restore();
-  return { drawnSlots: drawItems.length, activeLabels };
+  return { drawnSlots, activeLabels };
+}
+
+export function renderSpineAtTime(
+  ctx: CanvasRenderingContext2D,
+  compiled: CompiledSpineSkeleton,
+  animName: string,
+  time: number,
+  loadedImages: Record<string, HTMLImageElement>,
+  zoom: number,
+  options: RenderSpineOptions = {}
+): RenderSpineResult {
+  const bounds = options.overrideBounds || computeAnimationBounds(compiled, animName);
+  return renderSpineScene(
+    ctx,
+    [
+      {
+        compiled,
+        animName,
+        time,
+        images: loadedImages,
+        zOrder: 'char',
+      },
+    ],
+    bounds,
+    zoom,
+    options
+  );
 }

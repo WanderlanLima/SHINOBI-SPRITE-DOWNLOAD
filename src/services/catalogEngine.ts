@@ -115,54 +115,276 @@ const STATUS_SPINE_NAME_MAP: Array<[RegExp, string, string]> = [
   [/Youzhongguofeng/i, 'Passiva Especial · Itachi', 'Passiva'],
 ];
 
-const NINJA_PINYIN_TOKENS: Array<[RegExp, string[]]> = [
-  [/madara/i, ['yuzhiboban', 'xuzuoban', 'ban_']],
-  [/naruto/i, ['mingren', 'jiuwei']],
-  [/sasuke/i, ['zuozhu']],
-  [/kakashi/i, ['kakaxi']],
-  [/itachi/i, ['yuzhiboyou', 'anbuyou', 'xuzuoyou', 'you_']],
-  [/sakura/i, ['xiaoying', 'bhgs']],
-  [/tsunade/i, ['gangshou']],
-  [/jiraiya/i, ['zilaiye']],
-  [/orochimaru/i, ['dashewan']],
-  [/nagato|pain/i, ['changmen', 'peien', 'tiandao', 'xiuluodao', 'renjiandao', 'chushengdao']],
-  [/obito|tobi|m[áa]scara branca/i, ['daitu', 'afei', 'baimianju']],
-  [/minato/i, ['shuimen']],
-  [/hashirama/i, ['zhujian']],
-  [/tobirama/i, ['feijian']],
-  [/hiruzen/i, ['rican']],
-  [/gaara/i, ['woailuo']],
-  [/kisame/i, ['guijiao']],
-  [/deidara/i, ['didala', 'ddl']],
-  [/hidan/i, ['feiduan']],
-  [/kakuzu/i, ['jiaodu']],
-  [/konan/i, ['xiaonan']],
-  [/sasori/i, ['xie_', 'baijixie']],
-  [/hinata/i, ['chutian']],
-  [/neji/i, ['ningci']],
-  [/shikamaru/i, ['luwan']],
-  [/rock lee|\blee\b/i, ['xiaoli']],
-  [/guy|gai/i, ['kai_']],
-  [/shisui/i, ['zhishui']],
-  [/killer bee|\bbee\b/i, ['qilabi']],
-  [/onoki|ōnoki/i, ['dayemu']],
-  [/mei terumi|terumi/i, ['zhaomeiming']],
-  [/raikage|\bai\b/i, ['leikage', 'sidai']],
-  [/danzo|danzō/i, ['tuanzang']],
-  [/kabuto/i, ['doushi', 'yaoshidou']],
-  [/asuma/i, ['asima']],
-  [/yamato/i, ['dahe']],
-  [/hanz[ōo]/i, ['banzang']],
-  [/haku/i, ['bai_']],
-  [/zabuza/i, ['zaibuzhan']],
-  [/suigetsu/i, ['shuiyue']],
-  [/karin/i, ['xianglin']],
-  [/j[ūu]go/i, ['zhongwu']],
-  [/kushina/i, ['jiuxinnai']],
-  [/kaguya/i, ['huiye']],
-  [/boruto/i, ['boren']],
-  [/sarada/i, ['zuoliangna']],
-  [/mitsuki/i, ['siyue']],
+interface NinjaMediaRule {
+  namePattern: RegExp;
+  /** Tokens exatos permitidos para vídeos MP4 (match no filename em lowercase) */
+  videoTokens: string[];
+  /** Tokens proibidos para evitar falsos positivos (ex: tiandao em fengyingwoailuotiandao) */
+  excludeVideoTokens?: string[];
+  /** Tokens exatos permitidos para efeitos Spine (match no nome do bundle em lowercase) */
+  effectTokens: string[];
+}
+
+/**
+ * Regras específicas por variante de ninja (ordem da mais específica para a mais geral).
+ * Para ninjas sem nome textual no snapshot, a descoberta exata de vídeo/efeito também ocorre
+ * automaticamente ao vivo via comandos `@CMD` (`PLAYVEDIO` e `DISPLAYONFIGHTER`) no `vdfno_<id>.json`.
+ */
+const NINJA_MEDIA_RULES: NinjaMediaRule[] = [
+  // Os 6 Caminhos de Pain + Nagato — rigorosamente separados para nunca misturar vídeos!
+  {
+    namePattern: /caminho asura/i,
+    videoTokens: ['xiuluodao_'],
+    effectTokens: ['pesld', 'xiuluodao'],
+  },
+  {
+    namePattern: /caminho animal/i,
+    videoTokens: ['chushengdao_'],
+    effectTokens: ['pecsd', 'chushengdao'],
+  },
+  {
+    namePattern: /pain.*deva|caminho deva/i,
+    videoTokens: ['peien_texie', 'peien_herovideo', 'tiandaopeien_', 'vdfno_peatd'],
+    excludeVideoTokens: ['woailuo'],
+    effectTokens: ['peatd', 'tiandaopeien'],
+  },
+  {
+    namePattern: /caminho humano/i,
+    videoTokens: ['renjiandao_'],
+    effectTokens: ['perjd', 'renjiandao'],
+  },
+  {
+    namePattern: /caminho preta/i,
+    videoTokens: ['eguidao_'],
+    effectTokens: ['peegd', 'eguidao'],
+  },
+  {
+    namePattern: /caminho naraka/i,
+    videoTokens: ['diyudao_'],
+    effectTokens: ['pedyd', 'diyudao'],
+  },
+  {
+    namePattern: /nagato/i,
+    videoTokens: ['changmen_', 'qncm_'],
+    effectTokens: ['changmen', 'huituchangmen'],
+  },
+  // Variantes específicas de personagens nomeados no catálogo oficial
+  {
+    namePattern: /sasuke.*susano/i,
+    videoTokens: ['xuzuozuozhu_', 'vdfno_zuozhu_xznh', 'xznhsp'],
+    effectTokens: ['xuzuozuozhu', 'zuozhuxz'],
+  },
+  {
+    namePattern: /madara/i,
+    videoTokens: ['yuzhiboban', 'vdfno_yuzhiboban'],
+    effectTokens: ['yuzhiboban', 'xuzuoban', 'banzhongyanzhizhan'],
+  },
+  {
+    namePattern: /itachi.*anbu/i,
+    videoTokens: ['anbuyou_'],
+    effectTokens: ['anbuyou'],
+  },
+  {
+    namePattern: /itachi.*susano/i,
+    videoTokens: ['xznhyou'],
+    effectTokens: ['xuzuoyou'],
+  },
+  {
+    namePattern: /itachi/i,
+    videoTokens: ['yuzhiboyou_', 'you_texie', 'you_unskill', 'vdfno_youyd'],
+    effectTokens: ['yuzhiboyou', 'you_effect'],
+  },
+  {
+    namePattern: /tobi\b.*akatsuki/i,
+    videoTokens: ['afei_'],
+    effectTokens: ['afei_'],
+  },
+  {
+    namePattern: /m[áa]scara branca|obito/i,
+    videoTokens: ['baimianju_', 'vdfno_daitu', 'mianjunantexie'],
+    effectTokens: ['baimianju', 'daitu'],
+  },
+  {
+    namePattern: /tsunade.*jovem/i,
+    videoTokens: ['gangshou_texie', 'gangshou_herovideo'],
+    effectTokens: ['gangshou_effect'],
+  },
+  {
+    namePattern: /tsunade/i,
+    videoTokens: ['baihaogangshou_', 'bhgs_', 'yongzhuanggangshou'],
+    effectTokens: ['gangshou', 'bhgs'],
+  },
+  {
+    namePattern: /deidara.*reanima/i,
+    videoTokens: ['htddl_'],
+    effectTokens: ['htddl', 'huitudidala'],
+  },
+  {
+    namePattern: /deidara/i,
+    videoTokens: ['didala_', 'ddl_texie', 'vdfno_ddl'],
+    excludeVideoTokens: ['htddl'],
+    effectTokens: ['didala_effect', 'didalapifu'],
+  },
+  {
+    namePattern: /sasori/i,
+    videoTokens: ['xie_texie', 'xie_herovideo', 'baijixie_', 'vdfno_xie'],
+    effectTokens: ['baijixie', 'xie_effect'],
+  },
+  {
+    namePattern: /kakuzu/i,
+    videoTokens: ['jiaodu_texie', 'jiaodu2_texie'],
+    effectTokens: ['jiaodu'],
+  },
+  {
+    namePattern: /hidan/i,
+    videoTokens: ['feiduan_texie'],
+    effectTokens: ['feiduan'],
+  },
+  {
+    namePattern: /kisame/i,
+    videoTokens: ['guijiao_'],
+    effectTokens: ['guijiao'],
+  },
+  {
+    namePattern: /konan/i,
+    videoTokens: ['xiaonan_', 'vdfno_xiaonan'],
+    effectTokens: ['xiaonan'],
+  },
+  {
+    namePattern: /tobirama|segundo hokage/i,
+    videoTokens: ['qsfjsp_', 'vdfno_erdaidazhao'],
+    effectTokens: ['qianshoufeijian', 'xinchunfeijian'],
+  },
+  {
+    namePattern: /hashirama|primeiro hokage/i,
+    videoTokens: ['qianshouzhujian_', 'huituzhujian', 'vdfno_shujiejianglin'],
+    effectTokens: ['qianshouzhujian'],
+  },
+  {
+    namePattern: /hiruzen|terceiro hokage/i,
+    videoTokens: ['yuanfeirizhan_', 'yfrz_', 'huituyfrz_', 'vdfno_yuanfei'],
+    effectTokens: ['yuanfeirizhan', 'yfrz'],
+  },
+  {
+    namePattern: /minato|quarto hokage/i,
+    videoTokens: ['bofengshuime_', 'shuimen_'],
+    effectTokens: ['shuimen'],
+  },
+  {
+    namePattern: /naruto/i,
+    videoTokens: ['mingren_', 'vdfno_mingren', 'vdfno_5nrt'],
+    effectTokens: ['mingren'],
+  },
+  {
+    namePattern: /sasuke/i,
+    videoTokens: ['sasuke_', 'zuozhuxiao_', 'zyzuozhu_', 'vdfno_5ssk', 'vdfno_qilin'],
+    effectTokens: ['zuozhu'],
+  },
+  {
+    namePattern: /kakashi/i,
+    videoTokens: ['kakaxi_'],
+    effectTokens: ['kakaxi'],
+  },
+  {
+    namePattern: /sakura/i,
+    videoTokens: ['xiaoying_'],
+    effectTokens: ['xiaoying'],
+  },
+  {
+    namePattern: /jiraiya/i,
+    videoTokens: ['zilaiye_', 'xrzly_'],
+    effectTokens: ['zilaiye'],
+  },
+  {
+    namePattern: /orochimaru/i,
+    videoTokens: ['dashewan_', 'dashewa_', 'rzdsw'],
+    effectTokens: ['dashewan', 'dsw'],
+  },
+  {
+    namePattern: /gaara/i,
+    videoTokens: ['woailuo_', 'woailuorjdz_', 'fengyingwoailuo', 'vdfno_fengying'],
+    effectTokens: ['woailuo'],
+  },
+  {
+    namePattern: /hinata/i,
+    videoTokens: ['chutian_'],
+    effectTokens: ['chutian'],
+  },
+  {
+    namePattern: /neji/i,
+    videoTokens: ['ningci'],
+    effectTokens: ['ningci'],
+  },
+  {
+    namePattern: /shikamaru/i,
+    videoTokens: ['luwan_'],
+    effectTokens: ['luwan'],
+  },
+  {
+    namePattern: /rock lee|\blee\b/i,
+    videoTokens: ['xiaoli_'],
+    effectTokens: ['xiaoli'],
+  },
+  {
+    namePattern: /guy|gai/i,
+    videoTokens: ['kai_texie', 'jingmenkai_'],
+    effectTokens: ['kai_effect', 'jingmenkai'],
+  },
+  {
+    namePattern: /shisui/i,
+    videoTokens: ['yuzhibozhishui_', 'vdfno_zhishui'],
+    effectTokens: ['zhishui'],
+  },
+  {
+    namePattern: /killer bee|\bbee\b/i,
+    videoTokens: ['qilabi_', 'qlbwssp_'],
+    effectTokens: ['qilabi'],
+  },
+  {
+    namePattern: /onoki|ōnoki/i,
+    videoTokens: ['dayemu_', 'vdfno_tuying'],
+    effectTokens: ['dayemu'],
+  },
+  {
+    namePattern: /mei terumi|terumi/i,
+    videoTokens: ['zhaomeiming_', 'zhaomeimin_', 'vdfno_shuiying'],
+    effectTokens: ['zhaomeiming'],
+  },
+  {
+    namePattern: /raikage/i,
+    videoTokens: ['leiying_', 'sandaileiying', 'sidaileiying'],
+    effectTokens: ['leiying'],
+  },
+  {
+    namePattern: /kabuto/i,
+    videoTokens: ['yaoshidou_', 'xianrendou_'],
+    effectTokens: ['yaoshidou', 'xianrendou'],
+  },
+  {
+    namePattern: /asuma/i,
+    videoTokens: ['asima_'],
+    effectTokens: ['asima'],
+  },
+  {
+    namePattern: /yamato/i,
+    videoTokens: ['dahe_', 'vdfno_dahe'],
+    effectTokens: ['dahe'],
+  },
+  {
+    namePattern: /hanz[ōo]/i,
+    videoTokens: ['banzang_', 'shanjiaoyubanzang_', 'vdfno_hanzo'],
+    effectTokens: ['banzang'],
+  },
+  {
+    namePattern: /zabuza/i,
+    videoTokens: ['zaibuzhan_'],
+    effectTokens: ['zaibuzhan', 'zbz_'],
+  },
+  {
+    namePattern: /j[ūu]go/i,
+    videoTokens: ['zhongwu_'],
+    effectTokens: ['zhongwu'],
+  },
 ];
 
 export interface StudioSnapshot {
@@ -190,6 +412,8 @@ export interface FullCatalog {
   statusEffects: StatusEffectRecord[];
   spineModels: SpineBundle[];
   spineMap: Map<string, SpineBundle>;
+  /** Lookup case-insensitive pelo nome exato do bundle Spine (ex: `noe_pesldgwhs`) para resolver `@CMD` VFX */
+  spineByNameMap: Map<string, SpineBundle>;
   anim2d: Anim2DBundle[];
   anim2dMap: Map<string, Anim2DBundle>;
   videos: VideoRecord[];
@@ -213,11 +437,13 @@ function toAssetRef(f: ManifestFile, category?: string): AssetFileRef {
 }
 
 function classifySkillType(slotCode: string): SkillRecord['skillType'] {
-  if (/^a\d/i.test(slotCode)) return 'Esotérica';
+  // Validado diretamente nas tabelas do jogo e nos eventos `@CMD` de `vdfno_*.json`:
+  // s1 = Suprema/Ogi (UniqueSkill), a1 = Habilidade/Especial (skill), n1 = Ataque Normal (attack)
+  if (/^s\d/i.test(slotCode)) return 'Esotérica';
+  if (/^a\d/i.test(slotCode)) return 'Especial';
   if (/^n\d/i.test(slotCode)) return 'Ataque Básico';
   if (/^c\d/i.test(slotCode)) return 'Perseguição';
   if (/^p\d/i.test(slotCode)) return 'Passiva';
-  if (/^s\d/i.test(slotCode)) return 'Especial';
   return 'Outro';
 }
 
@@ -260,7 +486,7 @@ export function buildCatalog(
   const heroBannerFiles = new Map<string, AssetFileRef[]>();
   const heroSmallPicMap = new Map<string, AssetFileRef[]>();
   const heroSkillIconFiles = new Map<string, Map<string, AssetFileRef[]>>();
-  const spineGroupMap = new Map<string, { kind: SpineBundle['kind']; files: AssetFileRef[] }>();
+  const spineGroupMap = new Map<string, { displayName: string; kind: SpineBundle['kind']; files: AssetFileRef[] }>();
   const summonSpineFiles = new Map<string, AssetFileRef[]>();
   const summonEffectWebps: AssetFileRef[] = [];
   const summonFragments: AssetFileRef[] = [];
@@ -443,8 +669,9 @@ export function buildCatalog(
       const isImg = /\.(webp|png)$/i.test(fname);
       let base = fname.replace(/(\.leve)?\.(json|atlas|webp|png)$/i, '');
       if (isImg) base = base.replace(/_([2-9]|[1-2]\d)$/, '');
-      const key = `hd:${base}`;
-      const entry = spineGroupMap.get(key) || { kind: 'hd', files: [] };
+      const key = `hd:${base.toLowerCase()}`;
+      const entry = spineGroupMap.get(key) || { displayName: base, kind: 'hd', files: [] };
+      if (fname.endsWith('.json')) entry.displayName = base;
       entry.files.push(toAssetRef(f, 'spine_hd'));
       spineGroupMap.set(key, entry);
       continue;
@@ -476,15 +703,26 @@ export function buildCatalog(
         .replace(/\.leve\.(atlas|webp|png)$/i, '')
         .replace(/\.(json|atlas|webp|png)$/i, '');
       if (isImg) base = base.replace(/_([2-9]|[1-2]\d)$/, '');
+
+      // As texturas de todos os 1.356 efeitos de habilidade `noe_<X>` chamam-se `efeito_<X>*.webp`:
+      // unificamos no mesmo bundle `sp:noe_<x>` (case-insensitive) para que cada VFX tenha suas texturas!
+      if (isImg && /^efeito_/i.test(base)) {
+        base = `noe_${base.slice('efeito_'.length)}`;
+      }
+
       let kind: SpineBundle['kind'] = 'personagem';
-      if (/_effect$/i.test(base) || /efeito/i.test(base)) kind = 'efeito';
+      if (/^noe_/i.test(base) || /_effect$/i.test(base) || /efeito/i.test(base)) kind = 'efeito';
       else if (/lihui\d*$/i.test(base)) kind = 'retrato';
       else if (/texie\d*$/i.test(base)) kind = 'esoterica';
       else if (/_ground$/i.test(base)) kind = 'cenario';
       else if (/_pintura$/i.test(base)) kind = 'pintura';
 
-      const key = `sp:${base}`;
-      const entry = spineGroupMap.get(key) || { kind, files: [] };
+      const key = `sp:${base.toLowerCase()}`;
+      const entry = spineGroupMap.get(key) || { displayName: base, kind, files: [] };
+      if (fname.endsWith('.json')) {
+        entry.displayName = base;
+        entry.kind = kind;
+      }
       entry.files.push(toAssetRef(f, `spine_${kind}`));
       spineGroupMap.set(key, entry);
       continue;
@@ -641,11 +879,10 @@ export function buildCatalog(
         categoryLabel = 'Dublagem (História)';
       } else if (url.startsWith('acervo/som/nos/')) {
         category = 'vozes_combate';
-        categoryLabel = 'Vozes de Combate';
-        const mNos = filename.match(/^([1-3])(\d{3})_/);
-        if (mNos) {
-          heroId = `100${mNos[2]}`;
-        }
+        categoryLabel = 'Efeitos e Vozes de Batalha (@CMD)';
+        // IMPORTANTE: Arquivos em `acervo/som/nos/<N>_<M>.mp3` usam IDs internos sequenciais
+        // chamados via `{SOUND:name="nos_N_M"}` dentro do `vdfno_<id>.json` de cada ninja.
+        // NÃO correspondem aos últimos 3 dígitos do Hero ID (evita atribuir vozes de outros ninjas!).
       } else {
         const m = filename.match(/^(\d{5,8})_/);
         if (m) heroId = m[1];
@@ -666,6 +903,7 @@ export function buildCatalog(
 
   const spineModels: SpineBundle[] = [];
   const spineMap = new Map<string, SpineBundle>();
+  const spineByNameMap = new Map<string, SpineBundle>();
   const heroSpineLookup = new Map<string, SpineBundle[]>();
 
   for (const [key, entry] of spineGroupMap.entries()) {
@@ -681,12 +919,13 @@ export function buildCatalog(
     const pngUrls = entry.files.filter((x) => x.ext === 'png').map((x) => x.url);
     const finalImgs = imageUrls.length > 0 ? imageUrls : pngUrls;
 
-    const rawId = key.replace(/^(hd|sp):/, '');
-    const heroIdMatch = rawId.match(/^vdfnop?_(\d{6})/);
+    const rawId = entry.displayName;
+    const prefix = key.startsWith('hd:') ? 'hd' : 'sp';
+    const heroIdMatch = rawId.match(/^vdfnop?_(\d{6})/i);
     const heroId = heroIdMatch ? heroIdMatch[1] : null;
 
     const bundle: SpineBundle = {
-      id: key.replace(':', '__'),
+      id: `${prefix}__${rawId}`,
       name: rawId,
       kind: entry.kind,
       jsonUrl: jsonFile.url,
@@ -699,6 +938,9 @@ export function buildCatalog(
     };
     spineModels.push(bundle);
     spineMap.set(bundle.id, bundle);
+    if (!spineByNameMap.has(rawId.toLowerCase()) || prefix === 'sp') {
+      spineByNameMap.set(rawId.toLowerCase(), bundle);
+    }
 
     if (heroId) {
       const list = heroSpineLookup.get(heroId) || [];
@@ -734,6 +976,9 @@ export function buildCatalog(
       totalBytes: allFiles.reduce((acc, x) => acc + x.bytes, 0),
     };
     spineMap.set(bundle.id, bundle);
+    if (!spineByNameMap.has(base.toLowerCase())) {
+      spineByNameMap.set(base.toLowerCase(), bundle);
+    }
 
     const summon: SummonRecord = {
       id: base,
@@ -774,6 +1019,9 @@ export function buildCatalog(
       totalBytes: allFiles.reduce((acc, x) => acc + x.bytes, 0),
     };
     spineMap.set(bundle.id, bundle);
+    if (!spineByNameMap.has(base.toLowerCase())) {
+      spineByNameMap.set(base.toLowerCase(), bundle);
+    }
 
     const matchedLabel = STATUS_SPINE_NAME_MAP.find(([re]) => re.test(stem));
     statusEffects.push({
@@ -920,24 +1168,24 @@ export function buildCatalog(
       isPassive: boolean;
     }> = [
       {
-        code: 'a1',
+        code: 's1',
+        label: 'Ogi (Esotérica)',
+        shortLabel: 'Ogi',
+        preferredAnims: ['UniqueSkill', 'uniqueSkill', 'superUniqueSkill', 'aoyi', 'skill2'],
+        isPassive: false,
+      },
+      {
+        code: 'n1',
         label: 'Ataque Normal',
         shortLabel: 'Ataque',
         preferredAnims: ['attack', 'attackAction', 'atk', 'atk1'],
         isPassive: false,
       },
       {
-        code: 's1',
+        code: 'a1',
         label: 'Habilidade',
         shortLabel: 'Habilidade',
         preferredAnims: ['skill', 'skillAction', 'skill1', 'cast'],
-        isPassive: false,
-      },
-      {
-        code: 'n1',
-        label: 'Ogi (Esotérica)',
-        shortLabel: 'Ogi',
-        preferredAnims: ['UniqueSkill', 'uniqueSkill', 'superUniqueSkill', 'aoyi', 'skill2'],
         isPassive: false,
       },
       {
@@ -1012,6 +1260,10 @@ export function buildCatalog(
           ? ['idle']
           : code.startsWith('c')
           ? ['chase1', 'chase2']
+          : code.startsWith('s')
+          ? ['UniqueSkill', 'uniqueSkill', 'skill']
+          : code.startsWith('n')
+          ? ['attack', 'attackAction']
           : ['skill', 'UniqueSkill', 'attack'],
         isPassive: code.startsWith('p'),
       });
@@ -1052,33 +1304,31 @@ export function buildCatalog(
       (typeof textosMeta[`HeroBase_${id}_desc`] === 'string' && textosMeta[`HeroBase_${id}_desc`].trim()) ||
       null;
 
-    // Cross-link videos and Spine effects for this ninja via hero ID or pinyin tokens
-    const pinyinTokens: string[] = [];
-    for (const [re, toks] of NINJA_PINYIN_TOKENS) {
-      if (re.test(nameInfo.name)) {
-        pinyinTokens.push(...toks);
-      }
-    }
+    // Cross-link videos and Spine effects using FIRST matching variant-specific rule (no cross-path leakage!)
+    const matchedRule = nameInfo.official
+      ? NINJA_MEDIA_RULES.find((r) => r.namePattern.test(nameInfo.name)) || null
+      : null;
     const shortId = id.replace(/^100/, '');
-    const matchByTokens = (text: string) => {
-      const lower = text.toLowerCase();
-      if (lower.includes(id)) return true;
-      for (const tok of pinyinTokens) {
-        if (lower.includes(tok.toLowerCase())) return true;
-      }
-      return false;
-    };
 
-    const linkedVideos =
-      pinyinTokens.length > 0 || videos.some((v) => v.filename.includes(id))
-        ? videos.filter((v) => matchByTokens(v.filename)).slice(0, 8)
-        : [];
-    const linkedEffects =
-      pinyinTokens.length > 0
-        ? spineModels
-            .filter((s) => s.kind === 'efeito' && matchByTokens(s.name))
-            .slice(0, 8)
-        : [];
+    const linkedVideos = videos
+      .filter((v) => {
+        const lower = v.filename.toLowerCase();
+        if (lower.includes(id)) return true;
+        if (!matchedRule) return false;
+        if (matchedRule.excludeVideoTokens?.some((ex) => lower.includes(ex))) return false;
+        return matchedRule.videoTokens.some((tok) => lower.includes(tok));
+      })
+      .slice(0, 8);
+
+    const linkedEffects = matchedRule
+      ? spineModels
+          .filter((s) => {
+            if (s.kind !== 'efeito') return false;
+            const lower = s.name.toLowerCase();
+            return matchedRule.effectTokens.some((tok) => lower.includes(tok));
+          })
+          .slice(0, 12)
+      : [];
 
     const ninja: NinjaRecord = {
       id,
@@ -1246,6 +1496,7 @@ export function buildCatalog(
     statusEffects,
     spineModels,
     spineMap,
+    spineByNameMap,
     anim2d,
     anim2dMap,
     videos,

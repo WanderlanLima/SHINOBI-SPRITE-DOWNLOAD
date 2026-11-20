@@ -5,12 +5,15 @@ import {
   FileArchive,
   FolderTree,
   HardDrive,
+  Pause,
   Play,
   RotateCcw,
   Smartphone,
   Square,
   Terminal,
   Trash2,
+  WifiOff,
+  Zap,
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { FullCatalog } from '../services/catalogEngine';
@@ -28,8 +31,31 @@ import {
   type ZipProgress,
 } from '../services/clientZipper';
 import type { ZipExportItem, ZipExportRequest } from '../types';
+import {
+  clearMirrorCheckpoint,
+  loadMirrorCheckpoint,
+  type MirrorBackupCheckpoint,
+} from '../utils/backupCheckpointDb';
 import { formatBytes, formatNumber } from '../utils/format';
 import { supportsFileSystemSavePicker } from '../utils/zip64Stream';
+
+function formatEta(seconds?: number): string {
+  if (!seconds || !Number.isFinite(seconds) || seconds <= 0) return '';
+  if (seconds < 60) return `~${Math.ceil(seconds)}s`;
+  const totalMin = Math.ceil(seconds / 60);
+  if (totalMin < 60) return `~${totalMin} min`;
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return `~${h}h ${String(m).padStart(2, '0')}m`;
+}
+
+function formatSpeed(bytesPerSec?: number): string {
+  if (!bytesPerSec || !Number.isFinite(bytesPerSec) || bytesPerSec <= 0) return '';
+  if (bytesPerSec >= 1024 * 1024) {
+    return `${(bytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`;
+  }
+  return `${Math.round(bytesPerSec / 1024)} KB/s`;
+}
 
 interface ZipExporterViewProps {
   catalog: FullCatalog;
@@ -82,10 +108,20 @@ export function ZipExporterView({
 
   // Single Game-Mirror ZIP64 state
   const [mirrorScope, setMirrorScope] = useState<SingleMirrorScope>('full_all');
+  const [mirrorConcurrency, setMirrorConcurrency] = useState<number>(24);
   const [mirrorDownloading, setMirrorDownloading] = useState(false);
+  const [mirrorPausing, setMirrorPausing] = useState(false);
   const [mirrorProgress, setMirrorProgress] = useState<ZipProgress | null>(null);
   const [mirrorError, setMirrorError] = useState<string | null>(null);
   const [mirrorSuccess, setMirrorSuccess] = useState<string | null>(null);
+  const [savedCheckpoint, setSavedCheckpoint] = useState<MirrorBackupCheckpoint | null>(null);
+  const mirrorPauseRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    loadMirrorCheckpoint().then((ckpt) => {
+      if (ckpt) setSavedCheckpoint(ckpt);
+    });
+  }, []);
 
   // Custom ZIP builder state
   const [archiveName, setArchiveName] = useState('naruto_jotagame_acervo');
@@ -192,27 +228,59 @@ export function ZipExporterView({
     abortRef.current?.abort();
     setBatchRunning(false);
     setMirrorDownloading(false);
+    setMirrorPausing(false);
   };
 
-  const handleStartSingleMirrorExport = async () => {
+  const handlePauseMirrorDownload = () => {
+    setMirrorPausing(true);
+    mirrorPauseRef.current?.abort();
+  };
+
+  const handleDiscardCheckpoint = async () => {
+    await clearMirrorCheckpoint();
+    setSavedCheckpoint(null);
+    setMirrorError(null);
+  };
+
+  const handleStartSingleMirrorExport = async (resumeFrom?: MirrorBackupCheckpoint | null) => {
     const controller = new AbortController();
+    const pauseController = new AbortController();
     abortRef.current = controller;
+    mirrorPauseRef.current = pauseController;
     setMirrorDownloading(true);
+    setMirrorPausing(false);
     setMirrorProgress(null);
     setMirrorError(null);
     setMirrorSuccess(null);
     try {
       const res = await generateSingleGameMirrorZip64({
         catalog,
-        scope: mirrorScope,
+        scope: resumeFrom ? resumeFrom.scope : mirrorScope,
+        concurrency: mirrorConcurrency,
+        resumeCheckpoint: resumeFrom || null,
         onProgress: (p) => setMirrorProgress(p),
         signal: controller.signal,
+        pauseSignal: pauseController.signal,
       });
-      setMirrorSuccess(
-        `Backup único ZIP64 concluído! ${formatNumber(res.downloaded)} arquivos gravados com a estrutura exata de naruto.jotagame.com${
-          res.failed > 0 ? ` (${res.failed} falharam no CDN)` : ''
-        }. Agora você já pode enviar esse arquivo para o Google Drive e vinculá-lo na aba "Backup / Google Drive".`
-      );
+
+      if (res.paused) {
+        const refreshed = await loadMirrorCheckpoint();
+        setSavedCheckpoint(refreshed);
+        setMirrorSuccess(
+          `Progresso salvo no disco com segurança (${formatNumber(
+            res.downloaded
+          )} arquivos gravados). Quando quiser, clique em "Continuar de Onde Parou" para retomar sem perder nada!`
+        );
+      } else {
+        setSavedCheckpoint(null);
+        setMirrorSuccess(
+          `Backup único ZIP64 concluído! ${formatNumber(
+            res.downloaded
+          )} arquivos gravados com a estrutura exata de naruto.jotagame.com${
+            res.failed > 0 ? ` (${res.failed} falharam no CDN)` : ''
+          }. Agora você já pode enviar esse arquivo para o Google Drive e vinculá-lo na aba "Backup / Google Drive".`
+        );
+      }
     } catch (e) {
       if ((e as Error)?.name === 'AbortError') {
         setMirrorError('Geração do backup único cancelada.');
@@ -221,8 +289,10 @@ export function ZipExporterView({
       }
     } finally {
       setMirrorDownloading(false);
+      setMirrorPausing(false);
       setMirrorProgress(null);
       abortRef.current = null;
+      mirrorPauseRef.current = null;
     }
   };
 
@@ -461,13 +531,19 @@ export function ZipExporterView({
 
             {activePartId && partProgress && (
               <div className="p-4 bg-[#0F1219] border border-[#EA580C]/40 rounded-lg space-y-2">
-                <div className="flex items-center justify-between text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
                   <span className="font-medium text-white truncate">
                     Baixando: {partProgress.currentFile}
                   </span>
                   <span className="font-mono tabular-nums text-[#F97316] shrink-0">
                     {partPct}% ({partProgress.completed}/{partProgress.total}) ·{' '}
                     {formatBytes(partProgress.bytesDownloaded)}
+                    {formatSpeed(partProgress.speedBytesPerSec)
+                      ? ` · ${formatSpeed(partProgress.speedBytesPerSec)}`
+                      : ''}
+                    {formatEta(partProgress.etaSeconds)
+                      ? ` · ${formatEta(partProgress.etaSeconds)}`
+                      : ''}
                   </span>
                 </div>
                 <div className="w-full h-2 bg-[#1D2230] rounded-full overflow-hidden">
@@ -556,6 +632,52 @@ export function ZipExporterView({
       {mode === 'single_mirror' && (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
           <div className="lg:col-span-7 space-y-5">
+            {/* Saved Resumable Checkpoint Banner */}
+            {savedCheckpoint && !mirrorDownloading && (
+              <div className="bg-[#141A24] border border-[#EA580C]/60 rounded-xl p-4 space-y-3">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-xs font-semibold text-[#FB923C] uppercase tracking-wide">
+                      Progresso salvo encontrado no disco
+                    </div>
+                    <div className="text-sm font-semibold text-white mt-0.5 truncate">
+                      {savedCheckpoint.filename}
+                    </div>
+                    <div className="text-xs font-mono tabular-nums text-[#B6BFCF] mt-1">
+                      {formatNumber(savedCheckpoint.entries.length)} /{' '}
+                      {formatNumber(savedCheckpoint.totalFiles)} arquivos ·{' '}
+                      {formatBytes(savedCheckpoint.bytesDownloaded)} de{' '}
+                      {formatBytes(savedCheckpoint.totalBytes)} (
+                      {Math.min(
+                        99,
+                        Math.round(
+                          (savedCheckpoint.entries.length / Math.max(1, savedCheckpoint.totalFiles)) *
+                            100
+                        )
+                      )}
+                      %)
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2 shrink-0">
+                    <button
+                      onClick={() => handleStartSingleMirrorExport(savedCheckpoint)}
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-[#EA580C] hover:bg-[#C2410C] rounded-lg transition-colors whitespace-nowrap"
+                    >
+                      <Play className="w-3.5 h-3.5" />
+                      Continuar de Onde Parou
+                    </button>
+                    <button
+                      onClick={handleDiscardCheckpoint}
+                      className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-[#A8B1C6] bg-[#1C2230] hover:bg-[#273042] rounded-lg transition-colors whitespace-nowrap"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      Descartar
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
             <div className="bg-[#13161F] border border-[#222736] rounded-xl p-5 space-y-4">
               <div className="flex items-start justify-between gap-3">
                 <div>
@@ -563,13 +685,9 @@ export function ZipExporterView({
                     Backup em Único Arquivo ZIP64 (Estrutura Exata de naruto.jotagame.com)
                   </h2>
                   <p className="text-xs text-[#98A1B5] mt-1 leading-relaxed">
-                    Preserva 100% da árvore original do servidor (<span className="font-mono text-[#FB923C]">manifesto.json</span>,{' '}
-                    <span className="font-mono text-[#FB923C]">studio-snapshot.json</span>,{' '}
-                    <span className="font-mono text-white">acervo/</span>,{' '}
-                    <span className="font-mono text-white">dados/</span> e{' '}
-                    <span className="font-mono text-white">d/</span>) em um único arquivo ZIP64 sem
-                    compressão de mídia (STORE) para leitura instantânea via Google Drive caso o jogo
-                    feche.
+                    Motor turbo com buffer de escrita em disco (8 MB), conexões paralelas contínuas,
+                    timeout + retentativas automáticas contra travamentos e suporte a{' '}
+                    <strong className="text-white">Pausar e Continuar de onde parou</strong>.
                   </p>
                 </div>
               </div>
@@ -615,23 +733,78 @@ export function ZipExporterView({
                 ))}
               </div>
 
+              {/* Speed / Parallel Connections Selector */}
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 pt-2 border-t border-[#1E2331]">
+                <div className="flex items-center gap-1.5 text-xs text-[#A8B1C6]">
+                  <Zap className="w-3.5 h-3.5 text-[#F97316] shrink-0" />
+                  <span>Velocidade (conexões simultâneas):</span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  {(
+                    [
+                      [12, '12 (Estável)'],
+                      [24, '24 (Rápido)'],
+                      [36, '36 (Turbo Fibra)'],
+                    ] as const
+                  ).map(([num, label]) => (
+                    <button
+                      key={num}
+                      type="button"
+                      disabled={mirrorDownloading}
+                      onClick={() => setMirrorConcurrency(num)}
+                      className={`px-2.5 py-1.5 text-[11px] font-medium rounded-lg border transition-colors whitespace-nowrap ${
+                        mirrorConcurrency === num
+                          ? 'bg-[#EA580C]/20 border-[#EA580C] text-[#FB923C]'
+                          : 'bg-[#0F1219] border-[#242A3B] text-[#98A1B5] hover:text-white'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               {mirrorDownloading && mirrorProgress && (
-                <div className="p-4 bg-[#0F1219] border border-[#EA580C]/40 rounded-lg space-y-2">
-                  <div className="flex items-center justify-between text-xs">
-                    <span className="font-medium text-white truncate">
-                      Gravando no ZIP64: {mirrorProgress.currentFile}
+                <div className="p-4 bg-[#0F1219] border border-[#EA580C]/40 rounded-lg space-y-2.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                    <span className="font-medium text-white truncate flex items-center gap-1.5">
+                      {mirrorProgress.pausedOffline && (
+                        <WifiOff className="w-3.5 h-3.5 text-[#F59E0B] shrink-0" />
+                      )}
+                      <span>
+                        {mirrorProgress.stageLabel ||
+                          `Gravando no ZIP64: ${mirrorProgress.currentFile}`}
+                      </span>
                     </span>
                     <span className="font-mono tabular-nums text-[#F97316] shrink-0">
                       {mirrorPct}% ({formatNumber(mirrorProgress.completed)}/
-                      {formatNumber(mirrorProgress.total)}) ·{' '}
-                      {formatBytes(mirrorProgress.bytesDownloaded)}
+                      {formatNumber(mirrorProgress.total)})
                     </span>
                   </div>
-                  <div className="w-full h-2 bg-[#1D2230] rounded-full overflow-hidden">
+
+                  <div className="w-full h-2.5 bg-[#1D2230] rounded-full overflow-hidden">
                     <div
-                      className="h-full bg-[#EA580C] transition-all duration-150"
+                      className={`h-full transition-all duration-150 ${
+                        mirrorProgress.pausedOffline ? 'bg-[#F59E0B]' : 'bg-[#EA580C]'
+                      }`}
                       style={{ width: `${mirrorPct}%` }}
                     />
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono tabular-nums text-[#98A1B5]">
+                    <span>
+                      {formatBytes(mirrorProgress.bytesDownloaded)} /{' '}
+                      {formatBytes(mirrorProgress.totalBytes)}
+                      {mirrorProgress.failedCount
+                        ? ` · ${mirrorProgress.failedCount} falha(s)`
+                        : ''}
+                    </span>
+                    <span className="text-[#CBD5E1]">
+                      {formatSpeed(mirrorProgress.speedBytesPerSec) || 'Medindo velocidade...'}
+                      {formatEta(mirrorProgress.etaSeconds)
+                        ? ` · Restante ${formatEta(mirrorProgress.etaSeconds)}`
+                        : ''}
+                    </span>
                   </div>
                 </div>
               )}
@@ -645,7 +818,7 @@ export function ZipExporterView({
               {mirrorSuccess && (
                 <div className="p-3.5 text-xs text-[#86EFAC] bg-[#111C16] border border-[#1E4432] rounded-lg space-y-2">
                   <div>{mirrorSuccess}</div>
-                  {onGoToBackupSource && (
+                  {onGoToBackupSource && !savedCheckpoint && (
                     <button
                       onClick={onGoToBackupSource}
                       className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-[#16A34A] hover:bg-[#15803D] rounded-md"
@@ -659,16 +832,30 @@ export function ZipExporterView({
 
               <div className="flex flex-wrap items-center gap-2.5 pt-2">
                 {mirrorDownloading ? (
-                  <button
-                    onClick={handleStopDownload}
-                    className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-semibold text-white bg-[#DC2626] hover:bg-[#B91C1C] rounded-lg transition-colors"
-                  >
-                    <Square className="w-3.5 h-3.5" />
-                    Cancelar Gravação
-                  </button>
+                  <>
+                    {hasDirectDisk && (
+                      <button
+                        onClick={handlePauseMirrorDownload}
+                        disabled={mirrorPausing}
+                        className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-semibold text-white bg-[#D97706] hover:bg-[#B45309] disabled:opacity-50 rounded-lg transition-colors"
+                      >
+                        <Pause className="w-3.5 h-3.5" />
+                        {mirrorPausing
+                          ? 'Salvando progresso no disco...'
+                          : 'Pausar e Salvar Progresso'}
+                      </button>
+                    )}
+                    <button
+                      onClick={handleStopDownload}
+                      className="inline-flex items-center gap-2 px-3.5 py-2.5 text-xs font-medium text-[#FCA5A5] bg-[#2A1619] hover:bg-[#3B1D22] border border-[#4C1D24] rounded-lg transition-colors"
+                    >
+                      <Square className="w-3.5 h-3.5" />
+                      Cancelar
+                    </button>
+                  </>
                 ) : (
                   <button
-                    onClick={handleStartSingleMirrorExport}
+                    onClick={() => handleStartSingleMirrorExport(null)}
                     className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-semibold text-white bg-[#EA580C] hover:bg-[#C2410C] rounded-lg transition-colors"
                   >
                     <HardDrive className="w-4 h-4" />
@@ -689,23 +876,25 @@ export function ZipExporterView({
 
               <div className="text-[11px] text-[#7C859B] leading-relaxed">
                 {hasDirectDisk
-                  ? 'Seu navegador suporta gravação direta em disco (streaming ZIP64 com uso mínimo de RAM — ideal para gerar o backup completo de 12,8 GB pelo GitHub Pages).'
-                  : 'Neste navegador/ambiente, o download direto em memória suporta até ~600 MB (ex.: Backup Teste Rápido). Para gerar o arquivo único completo de 12,8 GB, use o GitHub Pages no Chrome/Edge ou o script Node.js ZIP64 abaixo.'}
+                  ? 'Gravação direta em disco ativa (buffer 8 MB + Wake Lock + Pausar/Continuar salvo no navegador). Para conexões fibra ou backups de 12,8 GB em segundo plano sem depender da aba, você também pode usar o Script Turbo (.mjs) abaixo.'
+                  : 'Neste navegador/ambiente, o download direto em memória suporta até ~600 MB (ex.: Backup Teste Rápido). Para gerar o arquivo único completo de 12,8 GB na velocidade máxima da sua internet com retomada automática, use o GitHub Pages no Chrome/Edge ou o Script Turbo (.mjs) abaixo.'}
               </div>
             </div>
 
-            {/* Standalone Zero-Dependency Node.js ZIP64 Mirror Generator */}
+            {/* Standalone Zero-Dependency Resumable Turbo Node.js ZIP64 Mirror Generator */}
             <div className="bg-[#13161F] border border-[#222736] rounded-xl p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
               <div>
                 <div className="flex items-center gap-2 text-sm font-semibold text-white">
                   <Terminal className="w-4 h-4 text-[#F97316]" />
-                  <span>Script Gerador de ZIP64 Único (.mjs — PC ou Android Termux)</span>
+                  <span>Script Turbo Retomável (.mjs — Máxima Velocidade no PC ou Termux)</span>
                 </div>
                 <p className="text-xs text-[#98A1B5] mt-1 leading-relaxed">
-                  Gera o arquivo único <span className="font-mono text-white">naruto_jotagame_backup_completo_100.zip</span>{' '}
-                  ({formatNumber(summary.totalFiles)} arquivos, {formatBytes(summary.totalBytes)}) com
-                  zero dependências externas, usando &lt;20 MB de RAM e pronto para subir no Google
-                  Drive.
+                  Usa <strong className="text-white">32 conexões paralelas</strong>, buffer de 8 MB e{' '}
+                  <strong className="text-white">checkpoint automático a cada 500 arquivos</strong>{' '}
+                  (se fechar ou apertar Ctrl+C, basta rodar novamente para continuar exatamente de
+                  onde parou sem perder 1 MB!). Gera{' '}
+                  <span className="font-mono text-white">naruto_jotagame_backup_completo_100.zip</span>{' '}
+                  ({formatNumber(summary.totalFiles)} arquivos, {formatBytes(summary.totalBytes)}).
                 </p>
               </div>
               <button
@@ -713,7 +902,7 @@ export function ZipExporterView({
                 className="inline-flex items-center gap-2 px-3.5 py-2.5 text-xs font-medium text-white bg-[#1F2536] hover:bg-[#EA580C] rounded-lg transition-colors whitespace-nowrap shrink-0"
               >
                 <Download className="w-3.5 h-3.5" />
-                Baixar Script ZIP64 (.mjs)
+                Baixar Script Turbo (.mjs)
               </button>
             </div>
           </div>

@@ -9,13 +9,14 @@ import {
   Volume2,
   X,
 } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useResolvedAssetUrl } from '../services/assetSource';
 import type { FullCatalog } from '../services/catalogEngine';
 import { downloadCustomRequestZip, type ZipProgress } from '../services/clientZipper';
 import type { AudioRecord, NinjaRecord, SpineBundle, VideoRecord } from '../types';
 import { formatBytes, resolveCdnUrl } from '../utils/format';
 import { lockBodyScroll } from '../utils/scrollLock';
+import type { DiscoveredSkeletonResources } from '../utils/spineCmdParser';
 import { AssetImage } from './AssetImage';
 import { NinjaSkillShowcase } from './NinjaSkillShowcase';
 
@@ -119,11 +120,58 @@ export function NinjaDetailDrawer({
   const [downloading, setDownloading] = useState(false);
   const [progress, setProgress] = useState<ZipProgress | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [discoveredResources, setDiscoveredResources] =
+    useState<DiscoveredSkeletonResources | null>(null);
+
+  useEffect(() => {
+    setDiscoveredResources(null);
+  }, [ninja?.id]);
+
+  const handleSkeletonResourcesDiscovered = useCallback(
+    (res: DiscoveredSkeletonResources) => {
+      setDiscoveredResources(res);
+    },
+    []
+  );
 
   useEffect(() => {
     if (!ninja) return;
     return lockBodyScroll();
   }, [ninja]);
+
+  const mergedEffects = useMemo<SpineBundle[]>(() => {
+    if (!ninja) return [];
+    const byId = new Map<string, SpineBundle>();
+    if (discoveredResources) {
+      for (const spineName of discoveredResources.vfxSpineNames) {
+        const hit = catalog.spineByNameMap.get(spineName.toLowerCase());
+        if (hit && !byId.has(hit.id)) byId.set(hit.id, hit);
+      }
+    }
+    for (const eff of ninja.linkedEffects) {
+      if (!byId.has(eff.id)) byId.set(eff.id, eff);
+    }
+    return [...byId.values()];
+  }, [ninja, discoveredResources, catalog.spineByNameMap]);
+
+  const mergedVideos = useMemo<VideoRecord[]>(() => {
+    if (!ninja) return [];
+    const byId = new Map<string, VideoRecord>();
+    if (discoveredResources && discoveredResources.videoSources.length > 0) {
+      const videoByStem = new Map<string, VideoRecord>();
+      for (const v of catalog.videos) {
+        videoByStem.set(v.filename.replace(/\.mp4$/i, '').toLowerCase(), v);
+      }
+      for (const source of discoveredResources.videoSources) {
+        const hit = videoByStem.get(source.toLowerCase());
+        if (hit && !byId.has(hit.id)) byId.set(hit.id, hit);
+      }
+    }
+    for (const vid of ninja.linkedVideos) {
+      if (!byId.has(vid.id)) byId.set(vid.id, vid);
+    }
+    return [...byId.values()];
+  }, [ninja, discoveredResources, catalog.videos]);
 
   if (!ninja) return null;
 
@@ -307,8 +355,9 @@ export function NinjaDetailDrawer({
             </div>
             <NinjaSkillShowcase
               ninja={ninja}
-              cdnBase={cdnBase}
+              catalog={catalog}
               onOpenFullPlayer={onInspectSpine}
+              onSkeletonResourcesDiscovered={handleSkeletonResourcesDiscovered}
             />
           </section>
 
@@ -352,16 +401,16 @@ export function NinjaDetailDrawer({
           </section>
 
           {/* Linked Skill Visual Effects (Spine) */}
-          {ninja.linkedEffects.length > 0 && (
+          {mergedEffects.length > 0 && (
             <section>
               <div className="flex items-center justify-between mb-3">
                 <h3 className="text-sm font-semibold text-white">
-                  Efeitos Visuais de Habilidades ({ninja.linkedEffects.length})
+                  Efeitos Visuais de Habilidades ({mergedEffects.length})
                 </h3>
-                <span className="text-xs text-[#7E879D]">Vínculo automático por personagem</span>
+                <span className="text-xs text-[#7E879D]">Confirmado via eventos @CMD do sprite</span>
               </div>
               <div className="space-y-2">
-                {ninja.linkedEffects.map((eff) => (
+                {mergedEffects.map((eff) => (
                   <div
                     key={eff.id}
                     className="flex items-center justify-between gap-3 px-4 py-3 bg-[#151924] border border-[#222736] rounded-lg"
@@ -390,16 +439,16 @@ export function NinjaDetailDrawer({
           )}
 
           {/* Linked Official Hero Videos (MP4) */}
-          {ninja.linkedVideos.length > 0 && (
+          {mergedVideos.length > 0 && (
             <section>
               <div className="flex items-center justify-between mb-3">
                 <h3 className="text-sm font-semibold text-white">
-                  Vídeos de Esotérica e Close-Up ({ninja.linkedVideos.length})
+                  Vídeos de Esotérica e Close-Up ({mergedVideos.length})
                 </h3>
-                <span className="text-xs text-[#7E879D]">MP4 original do servidor CDN</span>
+                <span className="text-xs text-[#7E879D]">Vínculo exato do personagem</span>
               </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                {ninja.linkedVideos.map((vid) => (
+                {mergedVideos.map((vid) => (
                   <DrawerVideoCard key={vid.id} vid={vid} cdnBase={cdnBase} />
                 ))}
               </div>
