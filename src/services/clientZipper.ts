@@ -3,6 +3,7 @@ import type { AssetFileRef, ManifestFile, ZipExportRequest } from '../types';
 import {
   clearMirrorCheckpoint,
   type MirrorBackupCheckpoint,
+  type MirrorStorageMode,
   saveMirrorCheckpoint,
 } from '../utils/backupCheckpointDb';
 import {
@@ -1165,12 +1166,237 @@ async function waitUntilOnlineOrAborted(
   });
 }
 
+export interface OpfsStorageSupport {
+  supported: boolean;
+  availableBytes: number;
+  quotaBytes: number;
+  usageBytes: number;
+}
+
+function isDiskStateChangedError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const name = (err as { name?: string }).name || '';
+  const msg = (err as { message?: string }).message || '';
+  return (
+    name === 'InvalidStateError' ||
+    /state had changed since it was read from disk/i.test(msg) ||
+    /cached in an interface object/i.test(msg)
+  );
+}
+
+export async function getOpfsStorageSupport(): Promise<OpfsStorageSupport> {
+  if (
+    typeof navigator === 'undefined' ||
+    !navigator.storage ||
+    typeof navigator.storage.getDirectory !== 'function'
+  ) {
+    return { supported: false, availableBytes: 0, quotaBytes: 0, usageBytes: 0 };
+  }
+
+  try {
+    // Safari OPFS does not expose FileSystemFileHandle.createWritable(); verify it exists
+    const hasWritable =
+      typeof FileSystemFileHandle !== 'undefined' &&
+      'createWritable' in FileSystemFileHandle.prototype;
+    if (!hasWritable) {
+      return { supported: false, availableBytes: 0, quotaBytes: 0, usageBytes: 0 };
+    }
+    await navigator.storage.getDirectory();
+    let quotaBytes = 0;
+    let usageBytes = 0;
+    if (typeof navigator.storage.estimate === 'function') {
+      const est = await navigator.storage.estimate();
+      quotaBytes = est.quota || 0;
+      usageBytes = est.usage || 0;
+    }
+    return {
+      supported: true,
+      quotaBytes,
+      usageBytes,
+      availableBytes: Math.max(0, quotaBytes - usageBytes),
+    };
+  } catch {
+    return { supported: false, availableBytes: 0, quotaBytes: 0, usageBytes: 0 };
+  }
+}
+
+export async function discardOpfsStagingFile(opfsFileName?: string): Promise<void> {
+  if (opfsFileName && typeof navigator !== 'undefined' && navigator.storage?.getDirectory) {
+    try {
+      const root = await navigator.storage.getDirectory();
+      await root.removeEntry(opfsFileName);
+    } catch {
+      // ignore if already removed or inaccessible
+    }
+  }
+  await clearMirrorCheckpoint();
+}
+
+export function isAndroidBrowser(): boolean {
+  return typeof navigator !== 'undefined' && /Android/i.test(navigator.userAgent || '');
+}
+
+/**
+ * Copia um backup ZIP64 já 100% finalizado no Cofre Seguro (OPFS) para a pasta real
+ * do aparelho:
+ * - No Android: usa por padrão o Gerenciador de Downloads nativo (<a download> direto do File no OPFS,
+ *   consumindo 0 MB extras de RAM e evitando 100% o bug InvalidStateError do Android SAF/MediaStore!).
+ * - No PC: usa por padrão showSaveFilePicker em blocos de 16 MB (~15-30s em SSD), mantendo o arquivo
+ *   no OPFS intacto caso a pasta escolhida dê InvalidStateError.
+ */
+export async function exportReadyOpfsBackupToDisk(opts: {
+  checkpoint: MirrorBackupCheckpoint;
+  method?: 'auto' | 'browser_download' | 'file_picker';
+  onProgress?: (progress: ZipProgress) => void;
+  signal?: AbortSignal;
+}): Promise<{ savedBytes: number; usedDirectDisk: boolean; keptInCache: boolean }> {
+  const { checkpoint, method = 'auto', onProgress, signal } = opts;
+  if (!checkpoint.opfsFileName) {
+    throw new Error('Arquivo do Cofre Seguro não encontrado no checkpoint.');
+  }
+
+  const root = await navigator.storage.getDirectory();
+  let opfsHandle: FileSystemFileHandle;
+  try {
+    opfsHandle = await root.getFileHandle(checkpoint.opfsFileName);
+  } catch {
+    await clearMirrorCheckpoint();
+    throw new Error(
+      'O arquivo temporário no Cofre Seguro foi limpo pelo navegador. Inicie o backup novamente.'
+    );
+  }
+
+  const opfsFile = await opfsHandle.getFile();
+  const totalSize = opfsFile.size;
+  const android = isAndroidBrowser();
+
+  const useFilePicker =
+    method === 'file_picker'
+      ? supportsFileSystemSavePicker()
+      : method === 'browser_download'
+      ? false
+      : !android && supportsFileSystemSavePicker();
+
+  if (useFilePicker) {
+    let targetHandle: any;
+    try {
+      const picker = (window as unknown as {
+        showSaveFilePicker: (pickerOpts: unknown) => Promise<any>;
+      }).showSaveFilePicker;
+      targetHandle = await picker({
+        suggestedName: checkpoint.filename,
+        types: [
+          {
+            description: 'Backup Único ZIP64 (naruto.jotagame.com)',
+            accept: { 'application/zip': ['.zip'] },
+          },
+        ],
+      });
+    } catch (err) {
+      if ((err as Error)?.name === 'AbortError') {
+        throw new DOMException('Salvamento cancelado pelo usuário.', 'AbortError');
+      }
+      throw err;
+    }
+
+    const writable = await targetHandle.createWritable();
+    const CHUNK_SIZE = 16 * 1024 * 1024;
+    const totalChunks = Math.max(1, Math.ceil(totalSize / CHUNK_SIZE));
+    const startTime = performance.now();
+    let written = 0;
+    let chunkIndex = 0;
+
+    try {
+      for (let pos = 0; pos < totalSize; pos += CHUNK_SIZE) {
+        if (signal?.aborted) {
+          try {
+            await writable.abort?.();
+          } catch {
+            // ignore
+          }
+          throw new DOMException('Cópia para o disco cancelada pelo usuário.', 'AbortError');
+        }
+
+        const end = Math.min(totalSize, pos + CHUNK_SIZE);
+        const buf = await opfsFile.slice(pos, end).arrayBuffer();
+        await writable.write(new Uint8Array(buf));
+        written = end;
+        chunkIndex++;
+
+        const elapsedSec = Math.max(0.1, (performance.now() - startTime) / 1000);
+        const speed = written / elapsedSec;
+        const eta = speed > 1024 ? Math.max(0, totalSize - written) / speed : undefined;
+
+        onProgress?.({
+          completed: chunkIndex,
+          total: totalChunks,
+          bytesDownloaded: written,
+          totalBytes: totalSize,
+          currentFile: checkpoint.filename,
+          speedBytesPerSec: speed,
+          etaSeconds: eta,
+          stageLabel: 'Copiando ZIP64 pronto para a pasta escolhida...',
+        });
+      }
+
+      onProgress?.({
+        completed: totalChunks,
+        total: totalChunks,
+        bytesDownloaded: totalSize,
+        totalBytes: totalSize,
+        currentFile: checkpoint.filename,
+        stageLabel: 'Confirmando gravação final no disco...',
+      });
+
+      await writable.close();
+    } catch (err) {
+      if ((err as Error)?.name === 'AbortError') {
+        throw err;
+      }
+      if (isDiskStateChangedError(err)) {
+        const gb = (totalSize / (1024 * 1024 * 1024)).toFixed(2);
+        throw new Error(
+          android
+            ? `O seletor de pastas do Android (SAF/MediaStore) bloqueou o salvamento final (InvalidStateError). Fique tranquilo: seu backup pronto de ${gb} GB CONTINUA 100% SALVO no Cofre Seguro! Clique no botão verde "Salvar na Pasta Downloads do Celular" para baixar via Gerenciador de Downloads nativo do Android sem esse erro.`
+            : `A pasta escolhida foi modificada pelo OneDrive, Google Drive Desktop ou antivírus durante a gravação (InvalidStateError). Fique tranquilo: seu backup pronto de ${gb} GB CONTINUA 100% SALVO no Cofre Seguro! Escolha uma pasta local fora do OneDrive ou clique em "Baixar via Downloads do Navegador".`
+        );
+      }
+      throw err;
+    }
+
+    // Somente apaga do Cofre Seguro DEPOIS que writable.close() concluiu com 100% de sucesso!
+    try {
+      await root.removeEntry(checkpoint.opfsFileName);
+    } catch {
+      // ignore
+    }
+    await clearMirrorCheckpoint();
+
+    return { savedBytes: totalSize, usedDirectDisk: true, keptInCache: false };
+  }
+
+  // Envia direto do File no OPFS para o Gerenciador de Downloads nativo (0 RAM extra, imune ao SAF InvalidStateError!)
+  const url = URL.createObjectURL(opfsFile);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = checkpoint.filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // Mantém o URL válido por 15 minutos para transferências grandes no Android
+  window.setTimeout(() => URL.revokeObjectURL(url), 15 * 60 * 1000);
+
+  return { savedBytes: totalSize, usedDirectDisk: false, keptInCache: true };
+}
+
 /**
  * Gera um ÚNICO arquivo ZIP64 mantendo 100% da estrutura original de naruto.jotagame.com
  * (manifesto.json + studio-snapshot.json + acervo/... + dados/... + d/...).
  *
  * Motor de alta velocidade & anti-travamento:
- * - Pool contínuo de 24–36 workers HTTP sem barreiras de lote (satura conexões rápidas!)
+ * - Cofre Seguro (OPFS) por padrão: baixa na sandbox privada do navegador (imune ao InvalidStateError
+ *   causado por OneDrive / Google Drive Desktop / Antivírus) e só depois copia para sua pasta em segundos!
+ * - Pool contínuo de 12–36 workers HTTP sem barreiras de lote (satura conexões rápidas!)
  * - Timeout individual por arquivo (18s) + 3 retentativas automáticas + `cache: 'no-store'`
  * - Escrita bufferizada em blocos de 8 MB (~100x menos chamadas de disco IPC no Chrome)
  * - Suporte a Pausar e Salvar Progresso (Checkpoint no IndexedDB) + Retomar exatamente de onde parou!
@@ -1179,6 +1405,7 @@ async function waitUntilOnlineOrAborted(
 export async function generateSingleGameMirrorZip64(opts: {
   catalog: FullCatalog;
   scope: SingleMirrorScope;
+  storageMode?: MirrorStorageMode;
   concurrency?: number;
   resumeCheckpoint?: MirrorBackupCheckpoint | null;
   onProgress?: (progress: ZipProgress) => void;
@@ -1189,10 +1416,12 @@ export async function generateSingleGameMirrorZip64(opts: {
   failed: number;
   usedDirectDisk: boolean;
   paused: boolean;
+  readyInOpfs: boolean;
 }> {
   const {
     catalog,
     scope,
+    storageMode = 'opfs',
     concurrency = 24,
     resumeCheckpoint = null,
     onProgress,
@@ -1200,11 +1429,15 @@ export async function generateSingleGameMirrorZip64(opts: {
     pauseSignal,
   } = opts;
   const effectiveScope = resumeCheckpoint ? resumeCheckpoint.scope : scope;
+  const effectiveStorageMode: MirrorStorageMode = resumeCheckpoint
+    ? resumeCheckpoint.storageMode
+    : storageMode;
   const plan = planSingleGameMirrorZip(catalog, effectiveScope);
   const cdnBase = catalog.summary.cdnBase;
 
   let sink: FileSystemWritableSink | MemoryBufferSink | null = null;
   let fileHandle: any = null;
+  let activeOpfsFileName: string | undefined;
   let usedDirectDisk = false;
   let writer: StreamingZip64Writer;
 
@@ -1216,7 +1449,42 @@ export async function generateSingleGameMirrorZip64(opts: {
   let totalBytes = plan.totalBytes;
   let remainingFiles: ManifestFile[] = plan.files;
 
-  if (resumeCheckpoint && resumeCheckpoint.handle) {
+  if (resumeCheckpoint && resumeCheckpoint.storageMode === 'opfs' && resumeCheckpoint.opfsFileName) {
+    try {
+      const root = await navigator.storage.getDirectory();
+      const opfsHandle = await root.getFileHandle(resumeCheckpoint.opfsFileName, { create: false });
+      const existingFile = await opfsHandle.getFile();
+      if (existingFile.size < resumeCheckpoint.offset) {
+        throw new Error(
+          'O arquivo parcial no Cofre Seguro foi alterado ou truncado pelo navegador. Descarte o checkpoint e inicie um novo backup.'
+        );
+      }
+      const writable = await opfsHandle.createWritable({ keepExistingData: true });
+      await writable.truncate(resumeCheckpoint.offset);
+      await writable.seek(resumeCheckpoint.offset);
+      sink = new FileSystemWritableSink(writable, 8 * 1024 * 1024);
+      activeOpfsFileName = resumeCheckpoint.opfsFileName;
+      usedDirectDisk = true;
+
+      writer = new StreamingZip64Writer(sink, {
+        initialOffset: resumeCheckpoint.offset,
+        initialEntries: resumeCheckpoint.entries,
+      });
+
+      const alreadyDone = new Set(resumeCheckpoint.entries.map((e) => e.path));
+      remainingFiles = plan.files.filter((f) => !alreadyDone.has(f.url.replace(/^\/+/, '')));
+      completed = resumeCheckpoint.entries.length;
+      bytesDownloaded = resumeCheckpoint.bytesDownloaded;
+      initialBytesDownloaded = bytesDownloaded;
+      totalCount = Math.max(plan.files.length + 2, completed + remainingFiles.length);
+      totalBytes = Math.max(resumeCheckpoint.totalBytes, plan.totalBytes);
+    } catch (err) {
+      if ((err as Error)?.name === 'AbortError') {
+        throw new DOMException('Retomada cancelada pelo usuário.', 'AbortError');
+      }
+      throw err;
+    }
+  } else if (resumeCheckpoint && resumeCheckpoint.handle) {
     fileHandle = resumeCheckpoint.handle;
     try {
       if (typeof fileHandle.queryPermission === 'function') {
@@ -1261,10 +1529,41 @@ export async function generateSingleGameMirrorZip64(opts: {
       throw err;
     }
   } else {
-    if (supportsFileSystemSavePicker()) {
+    if (effectiveStorageMode === 'opfs') {
+      const opfsSupport = await getOpfsStorageSupport();
+      if (opfsSupport.supported) {
+        const requiredBytes = plan.totalBytes * 1.03 + 64 * 1024 * 1024;
+        if (opfsSupport.quotaBytes > 0 && opfsSupport.availableBytes < requiredBytes) {
+          const availGb = (opfsSupport.availableBytes / (1024 * 1024 * 1024)).toFixed(2);
+          const reqGb = (requiredBytes / (1024 * 1024 * 1024)).toFixed(2);
+          throw new Error(
+            `Espaço insuficiente no Cofre Seguro do navegador (disponível: ${availGb} GB, necessário: ${reqGb} GB). Libere espaço em disco, troque para o modo "Direto no Disco" (em uma pasta local fora do OneDrive) ou use o Script Turbo (.mjs).`
+          );
+        }
+
+        try {
+          await navigator.storage.persist?.().catch(() => false);
+          const root = await navigator.storage.getDirectory();
+          const opfsName = `shinobi_staging_${effectiveScope}.zip`;
+          const opfsHandle = await root.getFileHandle(opfsName, { create: true });
+          const writable = await opfsHandle.createWritable();
+          sink = new FileSystemWritableSink(writable, 8 * 1024 * 1024);
+          activeOpfsFileName = opfsName;
+          usedDirectDisk = true;
+        } catch (err) {
+          throw new Error(
+            `Não foi possível abrir o Cofre Seguro (OPFS): ${
+              err instanceof Error ? err.message : 'erro desconhecido'
+            }. Tente o modo "Direto no Disco" ou o Script Turbo (.mjs).`
+          );
+        }
+      }
+    }
+
+    if (!sink && supportsFileSystemSavePicker()) {
       try {
         const picker = (window as unknown as {
-          showSaveFilePicker: (opts: unknown) => Promise<any>;
+          showSaveFilePicker: (pickerOpts: unknown) => Promise<any>;
         }).showSaveFilePicker;
         fileHandle = await picker({
           suggestedName: plan.filename,
@@ -1291,7 +1590,7 @@ export async function generateSingleGameMirrorZip64(opts: {
         throw new Error(
           `Este backup único tem ${(plan.totalBytes / (1024 * 1024 * 1024)).toFixed(
             2
-          )} GB e precisa da gravação direta em disco (Chrome/Edge fora de iframe, como no GitHub Pages) ou do Script Gerador ZIP64 (.mjs) abaixo. Para testar aqui agora mesmo, selecione "Backup Teste Rápido (~260 MB)".`
+          )} GB e precisa do Cofre Seguro (OPFS) ou gravação direta em disco (Chrome/Edge) ou do Script Turbo (.mjs) abaixo. Para testar aqui agora mesmo, selecione "Backup Teste Rápido (~260 MB)".`
         );
       }
       sink = new MemoryBufferSink();
@@ -1382,12 +1681,24 @@ export async function generateSingleGameMirrorZip64(opts: {
     });
   };
 
-  emitProgress(true, resumeCheckpoint ? 'Retomando de onde parou...' : 'Iniciando conexões paralelas...');
+  emitProgress(
+    true,
+    resumeCheckpoint
+      ? 'Retomando de onde parou...'
+      : activeOpfsFileName
+      ? 'Baixando no Cofre Seguro (protegido contra erros de disco)...'
+      : 'Iniciando conexões paralelas...'
+  );
 
   const failedItems: ManifestFile[] = [];
 
   // Pipelined continuous worker pool + bounded write queue (max 24 MB in RAM!)
-  const runDownloadPass = async (items: ManifestFile[], workerCount: number, timeoutMs: number, isRetryPass: boolean) => {
+  const runDownloadPass = async (
+    items: ManifestFile[],
+    workerCount: number,
+    timeoutMs: number,
+    isRetryPass: boolean
+  ) => {
     if (items.length === 0) return;
     const MAX_QUEUE_BYTES = 24 * 1024 * 1024;
     const writeQueue: Array<{ item: ManifestFile; data: Uint8Array }> = [];
@@ -1441,7 +1752,6 @@ export async function generateSingleGameMirrorZip64(opts: {
         writeFatalError = err;
         fetchCtrl.abort();
       } finally {
-        // Release any worker waiting on queue space
         while (queueNotFullWaiters.length > 0) {
           queueNotFullWaiters.shift()?.();
         }
@@ -1452,7 +1762,6 @@ export async function generateSingleGameMirrorZip64(opts: {
       while (cursor < items.length) {
         if (fetchCtrl.signal.aborted || writeFatalError) return;
 
-        // If browser went offline, wait seamlessly for reconnection instead of failing everything
         if (typeof navigator !== 'undefined' && navigator.onLine === false) {
           isPausedOffline = true;
           emitProgress(true, 'Sem internet — aguardando conexão voltar...');
@@ -1462,7 +1771,6 @@ export async function generateSingleGameMirrorZip64(opts: {
           emitProgress(true, 'Conexão restabelecida — continuando...');
         }
 
-        // Backpressure so RAM never spikes even if internet > disk write speed
         while (queuedBytes >= MAX_QUEUE_BYTES && !fetchCtrl.signal.aborted && !writeFatalError) {
           await new Promise<void>((resolve) => {
             queueNotFullWaiters.push(resolve);
@@ -1495,7 +1803,6 @@ export async function generateSingleGameMirrorZip64(opts: {
             completed++;
             emitProgress();
           }
-          // Brief breather if CDN temporarily rate-limits/drops a burst of connections
           if (consecutiveNetErrors >= 12) {
             consecutiveNetErrors = 0;
             await new Promise((r) => window.setTimeout(r, 1500));
@@ -1537,15 +1844,23 @@ export async function generateSingleGameMirrorZip64(opts: {
       completed += failedItems.length;
     }
 
-    // Graceful Pause & Save Checkpoint to Disk + IndexedDB!
+    // Graceful Pause & Save Checkpoint to OPFS or Disk + IndexedDB!
     if (pauseSignal?.aborted && !signal?.aborted) {
-      if (usedDirectDisk && fileHandle) {
-        emitProgress(true, 'Salvando progresso no disco para continuar depois...');
+      if (usedDirectDisk && (activeOpfsFileName || fileHandle)) {
+        emitProgress(
+          true,
+          activeOpfsFileName
+            ? 'Salvando progresso no Cofre Seguro para continuar depois...'
+            : 'Salvando progresso no disco para continuar depois...'
+        );
         const snap = await writer.flushAndSuspend();
         await saveMirrorCheckpoint({
           scope: effectiveScope,
+          storageMode: activeOpfsFileName ? 'opfs' : 'direct_disk',
           filename: plan.filename,
-          handle: fileHandle,
+          opfsFileName: activeOpfsFileName,
+          handle: activeOpfsFileName ? undefined : fileHandle,
+          readyToExport: false,
           offset: snap.offset,
           entries: snap.entries,
           failedUrls: failedItems.map((f) => f.url),
@@ -1558,6 +1873,7 @@ export async function generateSingleGameMirrorZip64(opts: {
           failed,
           usedDirectDisk,
           paused: true,
+          readyInOpfs: false,
         };
       }
       throw new DOMException('Backup pausado/cancelado.', 'AbortError');
@@ -1569,18 +1885,65 @@ export async function generateSingleGameMirrorZip64(opts: {
       } catch {
         // ignore close error on abort
       }
+      if (activeOpfsFileName) {
+        await discardOpfsStagingFile(activeOpfsFileName);
+      }
       throw new DOMException('Backup cancelado pelo usuário.', 'AbortError');
     }
 
     emitProgress(true, 'Gravando índice ZIP64 Central Directory...');
-    await writer.finalize();
+    try {
+      await writer.finalize();
+    } catch (err) {
+      if (isDiskStateChangedError(err)) {
+        throw new Error(
+          isAndroidBrowser()
+            ? 'O Android (MediaStore / Storage Access Framework) alterou o arquivo na pasta Downloads durante a gravação longa e o Chrome bloqueou a finalização (InvalidStateError). Use o modo "Cofre Seguro (OPFS — Recomendado)" — que grava na área isolada do navegador e depois envia para Downloads sem esse erro — ou use o Script Turbo (.mjs) no Termux.'
+            : 'O navegador bloqueou o salvamento final porque o arquivo .zip foi tocado pelo OneDrive, Google Drive Desktop, antivírus ou Explorador de Arquivos durante o download (InvalidStateError). Use o modo "Cofre Seguro (OPFS — Recomendado)" para ficar 100% imune a esse erro, ou salve em uma pasta local fora do OneDrive (ex.: C:\\Backups).'
+        );
+      }
+      throw err;
+    }
+
+    if (activeOpfsFileName) {
+      const root = await navigator.storage.getDirectory();
+      const opfsHandle = await root.getFileHandle(activeOpfsFileName);
+      const finalFile = await opfsHandle.getFile();
+      await saveMirrorCheckpoint({
+        scope: effectiveScope,
+        storageMode: 'opfs',
+        filename: plan.filename,
+        opfsFileName: activeOpfsFileName,
+        readyToExport: true,
+        offset: finalFile.size,
+        entries: [],
+        failedUrls: [],
+        bytesDownloaded: finalFile.size,
+        totalFiles: writer.getEntryCount(),
+        totalBytes: finalFile.size,
+      });
+      return {
+        downloaded: writer.getEntryCount(),
+        failed,
+        usedDirectDisk: true,
+        paused: false,
+        readyInOpfs: true,
+      };
+    }
+
     await clearMirrorCheckpoint();
 
     if (sink instanceof MemoryBufferSink) {
       triggerBlobDownload(sink.toBlob(), plan.filename);
     }
 
-    return { downloaded: writer.getEntryCount(), failed, usedDirectDisk, paused: false };
+    return {
+      downloaded: writer.getEntryCount(),
+      failed,
+      usedDirectDisk,
+      paused: false,
+      readyInOpfs: false,
+    };
   } finally {
     signal?.removeEventListener('abort', stopFetching);
     pauseSignal?.removeEventListener('abort', stopFetching);

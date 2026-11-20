@@ -1,10 +1,18 @@
 import type { Zip64EntrySnapshot } from './zip64Stream';
 
+export type MirrorStorageMode = 'opfs' | 'direct_disk';
+
 export interface MirrorBackupCheckpoint {
   id: string;
   scope: 'full_all' | 'full_webp' | 'core_playable' | 'quick_test';
+  storageMode: MirrorStorageMode;
   filename: string;
-  handle: any; // FileSystemFileHandle (natively structured-cloneable in IndexedDB)
+  /** Nome do arquivo dentro do Origin Private File System (OPFS) quando storageMode === 'opfs' */
+  opfsFileName?: string;
+  /** FileSystemFileHandle (usado quando storageMode === 'direct_disk') */
+  handle?: any;
+  /** true quando o ZIP64 já foi 100% finalizado no OPFS e aguarda apenas ser salvo na pasta escolhida */
+  readyToExport?: boolean;
   offset: number;
   entries: Zip64EntrySnapshot[];
   failedUrls: string[];
@@ -69,7 +77,12 @@ export async function loadMirrorCheckpoint(): Promise<MirrorBackupCheckpoint | n
       req.onerror = () => reject(req.error);
     });
     db.close();
-    return record;
+    if (!record) return null;
+    // Normalize older checkpoints created before storageMode was introduced
+    return {
+      ...record,
+      storageMode: record.storageMode || 'direct_disk',
+    };
   } catch {
     return null;
   }

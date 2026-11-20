@@ -105,14 +105,14 @@ export class MemoryBufferSink implements StreamingZip64Sink {
  */
 export class FileSystemWritableSink implements StreamingZip64Sink {
   private writable: {
-    write(data: Uint8Array): Promise<void>;
+    write(data: Uint8Array<ArrayBuffer>): Promise<void>;
     close(): Promise<void>;
   };
-  private buffer: Uint8Array;
+  private buffer: Uint8Array<ArrayBuffer>;
   private used = 0;
 
   constructor(
-    writable: { write(data: Uint8Array): Promise<void>; close(): Promise<void> },
+    writable: { write(data: Uint8Array<ArrayBuffer>): Promise<void>; close(): Promise<void> },
     bufferSizeBytes = 8 * 1024 * 1024
   ) {
     this.writable = writable;
@@ -126,7 +126,11 @@ export class FileSystemWritableSink implements StreamingZip64Sink {
     // If chunk itself is larger than buffer, flush existing buffer and write chunk directly
     if (len >= this.buffer.byteLength) {
       await this.flush();
-      await this.writable.write(chunk);
+      const safeChunk: Uint8Array<ArrayBuffer> =
+        chunk.buffer instanceof ArrayBuffer
+          ? (chunk as Uint8Array<ArrayBuffer>)
+          : new Uint8Array(chunk);
+      await this.writable.write(safeChunk);
       return;
     }
 

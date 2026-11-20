@@ -8,6 +8,7 @@ import {
   Pause,
   Play,
   RotateCcw,
+  ShieldCheck,
   Smartphone,
   Square,
   Terminal,
@@ -19,12 +20,17 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { FullCatalog } from '../services/catalogEngine';
 import {
   buildFullCatalogMobileParts,
+  discardOpfsStagingFile,
   downloadCustomRequestZip,
   downloadMirrorZip64ScriptFile,
+  exportReadyOpfsBackupToDisk,
   generateAndDownloadClientZip,
   generateSingleGameMirrorZip64,
+  getOpfsStorageSupport,
+  isAndroidBrowser,
   type MobileCatalogPart,
   type MobilePartCategoryKey,
+  type OpfsStorageSupport,
   planCustomZip,
   planSingleGameMirrorZip,
   type SingleMirrorScope,
@@ -32,9 +38,9 @@ import {
 } from '../services/clientZipper';
 import type { ZipExportItem, ZipExportRequest } from '../types';
 import {
-  clearMirrorCheckpoint,
   loadMirrorCheckpoint,
   type MirrorBackupCheckpoint,
+  type MirrorStorageMode,
 } from '../utils/backupCheckpointDb';
 import { formatBytes, formatNumber } from '../utils/format';
 import { supportsFileSystemSavePicker } from '../utils/zip64Stream';
@@ -108,6 +114,8 @@ export function ZipExporterView({
 
   // Single Game-Mirror ZIP64 state
   const [mirrorScope, setMirrorScope] = useState<SingleMirrorScope>('full_all');
+  const [mirrorStorageMode, setMirrorStorageMode] = useState<MirrorStorageMode>('opfs');
+  const [opfsSupport, setOpfsSupport] = useState<OpfsStorageSupport | null>(null);
   const [mirrorConcurrency, setMirrorConcurrency] = useState<number>(24);
   const [mirrorDownloading, setMirrorDownloading] = useState(false);
   const [mirrorPausing, setMirrorPausing] = useState(false);
@@ -115,11 +123,28 @@ export function ZipExporterView({
   const [mirrorError, setMirrorError] = useState<string | null>(null);
   const [mirrorSuccess, setMirrorSuccess] = useState<string | null>(null);
   const [savedCheckpoint, setSavedCheckpoint] = useState<MirrorBackupCheckpoint | null>(null);
+  const [opfsExporting, setOpfsExporting] = useState(false);
+  const [opfsExportProgress, setOpfsExportProgress] = useState<ZipProgress | null>(null);
   const mirrorPauseRef = useRef<AbortController | null>(null);
+
+  const refreshOpfsSupport = () => {
+    getOpfsStorageSupport().then((info) => {
+      setOpfsSupport(info);
+      if (!info.supported) {
+        setMirrorStorageMode('direct_disk');
+      }
+    });
+  };
 
   useEffect(() => {
     loadMirrorCheckpoint().then((ckpt) => {
       if (ckpt) setSavedCheckpoint(ckpt);
+    });
+    getOpfsStorageSupport().then((info) => {
+      setOpfsSupport(info);
+      if (!info.supported) {
+        setMirrorStorageMode('direct_disk');
+      }
     });
   }, []);
 
@@ -229,6 +254,7 @@ export function ZipExporterView({
     setBatchRunning(false);
     setMirrorDownloading(false);
     setMirrorPausing(false);
+    setOpfsExporting(false);
   };
 
   const handlePauseMirrorDownload = () => {
@@ -237,9 +263,58 @@ export function ZipExporterView({
   };
 
   const handleDiscardCheckpoint = async () => {
-    await clearMirrorCheckpoint();
+    await discardOpfsStagingFile(savedCheckpoint?.opfsFileName);
     setSavedCheckpoint(null);
     setMirrorError(null);
+    setMirrorSuccess(null);
+    refreshOpfsSupport();
+  };
+
+  const handleExportReadyOpfsToDisk = async (
+    method: 'auto' | 'browser_download' | 'file_picker' = 'auto'
+  ) => {
+    if (!savedCheckpoint || !savedCheckpoint.readyToExport) return;
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setOpfsExporting(true);
+    setOpfsExportProgress(null);
+    setMirrorError(null);
+    setMirrorSuccess(null);
+    try {
+      const res = await exportReadyOpfsBackupToDisk({
+        checkpoint: savedCheckpoint,
+        method,
+        onProgress: (p) => setOpfsExportProgress(p),
+        signal: controller.signal,
+      });
+      if (!res.keptInCache) {
+        setSavedCheckpoint(null);
+        refreshOpfsSupport();
+        setMirrorSuccess(
+          `Arquivo ZIP64 salvo com sucesso (${formatBytes(
+            res.savedBytes
+          )})! O cache temporário do Cofre Seguro já foi liberado. Agora basta enviar esse arquivo para o Google Drive e vinculá-lo na aba "Backup / Google Drive".`
+        );
+      } else {
+        setMirrorSuccess(
+          `Download iniciado pelo Gerenciador de Downloads (${formatBytes(
+            res.savedBytes
+          )})! Acompanhe na barra de notificações do celular/navegador. Só clique em "Apagar do Cache" DEPOIS que o download terminar 100% na pasta Downloads!`
+        );
+      }
+    } catch (e) {
+      if ((e as Error)?.name === 'AbortError') {
+        setMirrorError(
+          'Salvamento cancelado. Seu backup pronto continua salvo no Cofre Seguro — clique no botão verde acima quando quiser.'
+        );
+      } else {
+        setMirrorError(e instanceof Error ? e.message : 'Erro ao salvar arquivo ZIP no disco.');
+      }
+    } finally {
+      setOpfsExporting(false);
+      setOpfsExportProgress(null);
+      abortRef.current = null;
+    }
   };
 
   const handleStartSingleMirrorExport = async (resumeFrom?: MirrorBackupCheckpoint | null) => {
@@ -256,6 +331,7 @@ export function ZipExporterView({
       const res = await generateSingleGameMirrorZip64({
         catalog,
         scope: resumeFrom ? resumeFrom.scope : mirrorScope,
+        storageMode: resumeFrom ? resumeFrom.storageMode : mirrorStorageMode,
         concurrency: mirrorConcurrency,
         resumeCheckpoint: resumeFrom || null,
         onProgress: (p) => setMirrorProgress(p),
@@ -266,10 +342,22 @@ export function ZipExporterView({
       if (res.paused) {
         const refreshed = await loadMirrorCheckpoint();
         setSavedCheckpoint(refreshed);
+        refreshOpfsSupport();
         setMirrorSuccess(
-          `Progresso salvo no disco com segurança (${formatNumber(
+          `Progresso salvo com segurança (${formatNumber(
             res.downloaded
           )} arquivos gravados). Quando quiser, clique em "Continuar de Onde Parou" para retomar sem perder nada!`
+        );
+      } else if (res.readyInOpfs) {
+        const refreshed = await loadMirrorCheckpoint();
+        setSavedCheckpoint(refreshed);
+        refreshOpfsSupport();
+        setMirrorSuccess(
+          `Download concluído com sucesso no Cofre Seguro (${formatNumber(
+            res.downloaded
+          )} arquivos${
+            res.failed > 0 ? `, ${res.failed} falharam no CDN` : ''
+          })! Agora clique no botão verde "Salvar Arquivo ZIP no Computador" acima para copiar o arquivo pronto para sua pasta em poucos segundos.`
         );
       } else {
         setSavedCheckpoint(null);
@@ -284,6 +372,7 @@ export function ZipExporterView({
     } catch (e) {
       if ((e as Error)?.name === 'AbortError') {
         setMirrorError('Geração do backup único cancelada.');
+        refreshOpfsSupport();
       } else {
         setMirrorError(e instanceof Error ? e.message : 'Erro ao gerar backup único ZIP64.');
       }
@@ -365,7 +454,20 @@ export function ZipExporterView({
       ? Math.round((mirrorProgress.completed / mirrorProgress.total) * 100)
       : 0;
 
+  const opfsExportPct =
+    opfsExportProgress && opfsExportProgress.totalBytes > 0
+      ? Math.min(
+          100,
+          Math.round((opfsExportProgress.bytesDownloaded / opfsExportProgress.totalBytes) * 100)
+        )
+      : 0;
+
   const hasDirectDisk = supportsFileSystemSavePicker();
+  const isAndroid = isAndroidBrowser();
+  const hasOpfs = Boolean(opfsSupport?.supported);
+  const canPauseMirror =
+    (mirrorStorageMode === 'opfs' && hasOpfs) ||
+    (mirrorStorageMode === 'direct_disk' && hasDirectDisk);
 
   return (
     <div className="space-y-6">
@@ -632,13 +734,122 @@ export function ZipExporterView({
       {mode === 'single_mirror' && (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
           <div className="lg:col-span-7 space-y-5">
-            {/* Saved Resumable Checkpoint Banner */}
-            {savedCheckpoint && !mirrorDownloading && (
+            {/* Ready-to-Export OPFS Backup Banner (100% finalized & protected!) */}
+            {savedCheckpoint?.readyToExport && !mirrorDownloading && (
+              <div className="bg-[#0F1E17] border border-[#1E6041] rounded-xl p-5 space-y-3.5">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#4ADE80] uppercase tracking-wide">
+                      <ShieldCheck className="w-4 h-4 shrink-0" />
+                      Backup ZIP64 100% pronto no Cofre Seguro
+                    </div>
+                    <div className="text-sm font-semibold text-white mt-1 truncate">
+                      {savedCheckpoint.filename}
+                    </div>
+                    <div className="text-xs font-mono tabular-nums text-[#B7E4C7] mt-1">
+                      {formatNumber(savedCheckpoint.totalFiles)} arquivos ·{' '}
+                      {formatBytes(savedCheckpoint.totalBytes)}
+                    </div>
+                    <p className="text-[11px] text-[#9BC4AE] mt-1.5 leading-relaxed">
+                      {isAndroid
+                        ? 'O arquivo já está montado na área privada do Chrome. Toque no botão verde abaixo para enviá-lo direto para a pasta Downloads do Android pelo Gerenciador de Downloads (imune ao erro InvalidStateError!).'
+                        : 'O arquivo já está montado e salvo em área protegida. Clique abaixo para salvá-lo em uma pasta local (fora do OneDrive/Google Drive Desktop) em poucos segundos — se a pasta escolhida falhar, seu backup continua 100% intacto aqui!'}
+                    </p>
+                  </div>
+                </div>
+
+                {opfsExporting && opfsExportProgress && (
+                  <div className="p-3.5 bg-[#0A1310] border border-[#1E6041] rounded-lg space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                      <span className="font-medium text-white truncate">
+                        {opfsExportProgress.stageLabel || 'Copiando ZIP64 para o disco...'}
+                      </span>
+                      <span className="font-mono tabular-nums text-[#4ADE80] shrink-0">
+                        {opfsExportPct}%
+                      </span>
+                    </div>
+                    <div className="w-full h-2 bg-[#162C22] rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-[#22C55E] transition-all duration-150"
+                        style={{ width: `${opfsExportPct}%` }}
+                      />
+                    </div>
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono tabular-nums text-[#9BC4AE]">
+                      <span>
+                        {formatBytes(opfsExportProgress.bytesDownloaded)} /{' '}
+                        {formatBytes(opfsExportProgress.totalBytes)}
+                      </span>
+                      <span>
+                        {formatSpeed(opfsExportProgress.speedBytesPerSec) || 'Copiando...'}
+                        {formatEta(opfsExportProgress.etaSeconds)
+                          ? ` · Restante ${formatEta(opfsExportProgress.etaSeconds)}`
+                          : ''}
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+                <div className="flex flex-wrap items-center gap-2.5">
+                  {opfsExporting ? (
+                    <button
+                      onClick={handleStopDownload}
+                      className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium text-[#FCA5A5] bg-[#2A1619] hover:bg-[#3B1D22] border border-[#4C1D24] rounded-lg transition-colors"
+                    >
+                      <Square className="w-3.5 h-3.5" />
+                      Cancelar Cópia
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        onClick={() => handleExportReadyOpfsToDisk('auto')}
+                        className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-semibold text-white bg-[#16A34A] hover:bg-[#15803D] rounded-lg transition-colors whitespace-nowrap"
+                      >
+                        <Download className="w-4 h-4" />
+                        {isAndroid
+                          ? `Salvar na Pasta Downloads (${formatBytes(savedCheckpoint.totalBytes)})`
+                          : `Salvar Arquivo ZIP no Computador (${formatBytes(savedCheckpoint.totalBytes)})`}
+                      </button>
+
+                      {!isAndroid && hasDirectDisk && (
+                        <button
+                          onClick={() => handleExportReadyOpfsToDisk('browser_download')}
+                          className="inline-flex items-center gap-1.5 px-3 py-2.5 text-xs font-medium text-[#D7F5E3] bg-[#162B22] hover:bg-[#1E3B2F] rounded-lg transition-colors whitespace-nowrap"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          Baixar via Downloads do Navegador
+                        </button>
+                      )}
+
+                      {isAndroid && hasDirectDisk && (
+                        <button
+                          onClick={() => handleExportReadyOpfsToDisk('file_picker')}
+                          className="inline-flex items-center gap-1.5 px-3 py-2.5 text-xs font-medium text-[#D7F5E3] bg-[#162B22] hover:bg-[#1E3B2F] rounded-lg transition-colors whitespace-nowrap"
+                        >
+                          <HardDrive className="w-3.5 h-3.5" />
+                          Escolher Outra Pasta
+                        </button>
+                      )}
+
+                      <button
+                        onClick={handleDiscardCheckpoint}
+                        className="inline-flex items-center gap-1.5 px-3 py-2.5 text-xs font-medium text-[#A8B1C6] bg-[#16211D] hover:bg-[#1E2E28] rounded-lg transition-colors whitespace-nowrap"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        Apagar do Cache (Liberar Espaço)
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Saved Resumable Checkpoint Banner (Paused mid-download) */}
+            {savedCheckpoint && !savedCheckpoint.readyToExport && !mirrorDownloading && (
               <div className="bg-[#141A24] border border-[#EA580C]/60 rounded-xl p-4 space-y-3">
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div className="min-w-0">
                     <div className="text-xs font-semibold text-[#FB923C] uppercase tracking-wide">
-                      Progresso salvo encontrado no disco
+                      Progresso salvo encontrado ({savedCheckpoint.storageMode === 'opfs' ? 'Cofre Seguro' : 'Disco'})
                     </div>
                     <div className="text-sm font-semibold text-white mt-0.5 truncate">
                       {savedCheckpoint.filename}
@@ -685,8 +896,9 @@ export function ZipExporterView({
                     Backup em Único Arquivo ZIP64 (Estrutura Exata de naruto.jotagame.com)
                   </h2>
                   <p className="text-xs text-[#98A1B5] mt-1 leading-relaxed">
-                    Motor turbo com buffer de escrita em disco (8 MB), conexões paralelas contínuas,
-                    timeout + retentativas automáticas contra travamentos e suporte a{' '}
+                    Motor turbo com buffer de 8 MB, conexões paralelas contínuas, proteção contra o
+                    erro <span className="font-mono text-[#CBD5E1]">InvalidStateError</span> via{' '}
+                    <strong className="text-white">Cofre Seguro (OPFS)</strong> e suporte a{' '}
                     <strong className="text-white">Pausar e Continuar de onde parou</strong>.
                   </p>
                 </div>
@@ -720,7 +932,7 @@ export function ZipExporterView({
                   <button
                     key={key}
                     onClick={() => setMirrorScope(key)}
-                    disabled={mirrorDownloading}
+                    disabled={mirrorDownloading || opfsExporting}
                     className={`text-left p-3.5 rounded-xl border transition-colors ${
                       mirrorScope === key
                         ? 'bg-[#EA580C]/15 border-[#EA580C]'
@@ -731,6 +943,64 @@ export function ZipExporterView({
                     <div className="text-[11px] text-[#8E97AB] mt-1 leading-relaxed">{desc}</div>
                   </button>
                 ))}
+              </div>
+
+              {/* Storage Mode Selector: OPFS Safe Staging vs Direct-to-Disk */}
+              <div className="space-y-2 pt-3 border-t border-[#1E2331]">
+                <div className="flex items-center justify-between gap-2 text-xs text-[#A8B1C6]">
+                  <span className="inline-flex items-center gap-1.5 font-medium text-white">
+                    <ShieldCheck className="w-3.5 h-3.5 text-[#4ADE80]" />
+                    Modo de Gravação (Anti-Erro de Disco):
+                  </span>
+                  {hasOpfs && opfsSupport && opfsSupport.quotaBytes > 0 && (
+                    <span className="text-[11px] font-mono tabular-nums text-[#8E97AB]">
+                      Cofre disponível: {formatBytes(opfsSupport.availableBytes)}
+                    </span>
+                  )}
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  <button
+                    type="button"
+                    disabled={mirrorDownloading || opfsExporting || !hasOpfs}
+                    onClick={() => setMirrorStorageMode('opfs')}
+                    className={`text-left p-3 rounded-xl border transition-colors disabled:opacity-45 ${
+                      mirrorStorageMode === 'opfs' && hasOpfs
+                        ? 'bg-[#11241B] border-[#22C55E]'
+                        : 'bg-[#0F1219] border-[#222736] hover:border-[#343C52]'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-semibold text-white">
+                        Cofre Seguro (OPFS — Recomendado)
+                      </span>
+                    </div>
+                    <div className="text-[11px] text-[#8E97AB] mt-1 leading-relaxed">
+                      {hasOpfs
+                        ? isAndroid
+                          ? 'Baixa na área privada do Chrome (imune ao erro de disco do Android/MediaStore) e depois envia direto para Downloads. Requer ~2x o tamanho livre temporariamente.'
+                          : 'Baixa em área isolada do navegador (imune ao OneDrive/antivírus) e só depois copia para sua pasta em segundos.'
+                        : 'Indisponível neste navegador. Use Direto no Disco ou Script Turbo (.mjs).'}
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={mirrorDownloading || opfsExporting}
+                    onClick={() => setMirrorStorageMode('direct_disk')}
+                    className={`text-left p-3 rounded-xl border transition-colors disabled:opacity-45 ${
+                      mirrorStorageMode === 'direct_disk' || !hasOpfs
+                        ? 'bg-[#EA580C]/15 border-[#EA580C]'
+                        : 'bg-[#0F1219] border-[#222736] hover:border-[#343C52]'
+                    }`}
+                  >
+                    <div className="text-xs font-semibold text-white">Direto no Disco</div>
+                    <div className="text-[11px] text-[#8E97AB] mt-1 leading-relaxed">
+                      {isAndroid
+                        ? 'Usa menos espaço, mas o Android (MediaStore/SAF) costuma dar InvalidStateError ao finalizar arquivos grandes no Chrome.'
+                        : 'Grava direto no arquivo final (sem cópia extra). Importante: escolha uma pasta local fora do OneDrive/Google Drive Desktop.'}
+                    </div>
+                  </button>
+                </div>
               </div>
 
               {/* Speed / Parallel Connections Selector */}
@@ -750,7 +1020,7 @@ export function ZipExporterView({
                     <button
                       key={num}
                       type="button"
-                      disabled={mirrorDownloading}
+                      disabled={mirrorDownloading || opfsExporting}
                       onClick={() => setMirrorConcurrency(num)}
                       className={`px-2.5 py-1.5 text-[11px] font-medium rounded-lg border transition-colors whitespace-nowrap ${
                         mirrorConcurrency === num
@@ -816,7 +1086,7 @@ export function ZipExporterView({
               )}
 
               {mirrorSuccess && (
-                <div className="p-3.5 text-xs text-[#86EFAC] bg-[#111C16] border border-[#1E4432] rounded-lg space-y-2">
+                <div className="p-3.5 text-xs text-[#86EFAC] bg-[#111C16] border border-[#1E4432] rounded-lg space-y-2 leading-relaxed">
                   <div>{mirrorSuccess}</div>
                   {onGoToBackupSource && !savedCheckpoint && (
                     <button
@@ -833,7 +1103,7 @@ export function ZipExporterView({
               <div className="flex flex-wrap items-center gap-2.5 pt-2">
                 {mirrorDownloading ? (
                   <>
-                    {hasDirectDisk && (
+                    {canPauseMirror && (
                       <button
                         onClick={handlePauseMirrorDownload}
                         disabled={mirrorPausing}
@@ -841,7 +1111,7 @@ export function ZipExporterView({
                       >
                         <Pause className="w-3.5 h-3.5" />
                         {mirrorPausing
-                          ? 'Salvando progresso no disco...'
+                          ? 'Salvando progresso...'
                           : 'Pausar e Salvar Progresso'}
                       </button>
                     )}
@@ -856,10 +1126,17 @@ export function ZipExporterView({
                 ) : (
                   <button
                     onClick={() => handleStartSingleMirrorExport(null)}
-                    className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-semibold text-white bg-[#EA580C] hover:bg-[#C2410C] rounded-lg transition-colors"
+                    disabled={opfsExporting}
+                    className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-semibold text-white bg-[#EA580C] hover:bg-[#C2410C] disabled:opacity-45 rounded-lg transition-colors"
                   >
-                    <HardDrive className="w-4 h-4" />
-                    Gerar e Salvar ZIP Único ({formatBytes(mirrorPlan.totalBytes)})
+                    {mirrorStorageMode === 'opfs' && hasOpfs ? (
+                      <ShieldCheck className="w-4 h-4" />
+                    ) : (
+                      <HardDrive className="w-4 h-4" />
+                    )}
+                    {mirrorStorageMode === 'opfs' && hasOpfs
+                      ? `Baixar no Cofre Seguro (${formatBytes(mirrorPlan.totalBytes)})`
+                      : `Gerar e Salvar ZIP Único (${formatBytes(mirrorPlan.totalBytes)})`}
                   </button>
                 )}
 
@@ -875,9 +1152,15 @@ export function ZipExporterView({
               </div>
 
               <div className="text-[11px] text-[#7C859B] leading-relaxed">
-                {hasDirectDisk
-                  ? 'Gravação direta em disco ativa (buffer 8 MB + Wake Lock + Pausar/Continuar salvo no navegador). Para conexões fibra ou backups de 12,8 GB em segundo plano sem depender da aba, você também pode usar o Script Turbo (.mjs) abaixo.'
-                  : 'Neste navegador/ambiente, o download direto em memória suporta até ~600 MB (ex.: Backup Teste Rápido). Para gerar o arquivo único completo de 12,8 GB na velocidade máxima da sua internet com retomada automática, use o GitHub Pages no Chrome/Edge ou o Script Turbo (.mjs) abaixo.'}
+                {mirrorStorageMode === 'opfs' && hasOpfs
+                  ? isAndroid
+                    ? 'Cofre Seguro (OPFS) ativo para Android: o ZIP64 é montado na área privada do Chrome (imune ao erro InvalidStateError do Android/MediaStore) e ao concluir é enviado direto para a pasta Downloads pelo Gerenciador de Downloads nativo. Dica: se o celular tiver pouco espaço livre (menos de 2x o tamanho do ZIP), use o Script Turbo (.mjs) no Termux abaixo.'
+                    : 'Cofre Seguro (OPFS) ativo: o ZIP64 é gravado na área privada do navegador — OneDrive, Google Drive Desktop e antivírus não conseguem corromper ou bloquear a finalização. Ao terminar, você salva para qualquer pasta local em segundos.'
+                  : hasDirectDisk
+                  ? isAndroid
+                    ? 'Atenção no Android: o modo Direto no Disco usa o seletor SAF do Android, que costuma dar InvalidStateError ao finalizar downloads longos. Recomendamos o Cofre Seguro (OPFS) ou o Script Turbo (.mjs) no Termux.'
+                    : 'Modo Direto no Disco ativo (buffer 8 MB + Wake Lock + Pausar/Continuar). Dica importante: evite escolher pastas sincronizadas pelo OneDrive ou Google Drive Desktop (ex.: Área de Trabalho/Documentos sincronizados) para evitar o erro InvalidStateError ao finalizar.'
+                  : 'Neste navegador/ambiente, o download direto em memória suporta até ~600 MB (ex.: Backup Teste Rápido). Para gerar o arquivo único completo de 12,8 GB sem travamentos, use Chrome/Edge ou o Script Turbo (.mjs) abaixo.'}
               </div>
             </div>
 
