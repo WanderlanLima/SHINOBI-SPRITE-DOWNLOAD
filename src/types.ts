@@ -72,6 +72,16 @@ export interface VideoRecord {
   bytes: number;
 }
 
+export interface NinjaSkillSlot {
+  slotCode: string;
+  label: string;
+  shortLabel: string;
+  iconUrl: string | null;
+  skill: SkillRecord | null;
+  preferredAnims: string[];
+  isPassive: boolean;
+}
+
 export interface NinjaRecord {
   id: string;
   shortId: string;
@@ -91,6 +101,10 @@ export interface NinjaRecord {
   spineBundles: SpineBundle[];
   audioFiles: AudioRecord[];
   skills: SkillRecord[];
+  skillSlots: NinjaSkillSlot[];
+  skillIcons: AssetFileRef[];
+  linkedVideos: VideoRecord[];
+  linkedEffects: SpineBundle[];
   hasHdSpine: boolean;
   hasBattleSpine: boolean;
   fileCount: number;
@@ -107,10 +121,59 @@ export interface SummonRecord {
   fileCount: number;
 }
 
+export interface StatusEffectRecord {
+  id: string;
+  rawCode: string;
+  name: string;
+  category: string;
+  spine: SpineBundle;
+  previewUrl: string | null;
+  totalBytes: number;
+  fileCount: number;
+}
+
 export interface ItemRecord {
   id: string;
   desc: string;
   iconUrl: string | null;
+}
+
+export type VisualAssetCategory =
+  | 'arenas_fundos'
+  | 'mapas_vivos'
+  | 'historia_dialogos'
+  | 'titulos_molduras'
+  | 'artes_ptbr'
+  | 'modos_extras';
+
+export interface VisualAssetRecord {
+  id: string;
+  name: string;
+  url: string;
+  category: VisualAssetCategory;
+  subfolder: string;
+  ext: string;
+  bytes: number;
+}
+
+export interface FontAssetRecord {
+  id: string;
+  name: string;
+  kind: 'ttf' | 'bitmap';
+  fileUrl: string;
+  previewUrl: string | null;
+  allFiles: AssetFileRef[];
+  totalBytes: number;
+}
+
+export interface VisualItemRecord {
+  id: string;
+  name: string;
+  group: 'item' | 'ferramenta' | 'runa' | 'outro';
+  groupLabel: string;
+  url: string;
+  desc: string | null;
+  bytes: number;
 }
 
 export interface CatalogSummary {
@@ -136,6 +199,11 @@ export interface CatalogSummary {
     audio: number;
     techniques: number;
     items: number;
+    statusEffects: number;
+    visualAssets: number;
+    visualItems: number;
+    fontAssets: number;
+    encryptedTables: number;
   };
   audioByCategory: Record<string, number>;
   spineByKind: Record<string, number>;

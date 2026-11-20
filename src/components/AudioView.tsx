@@ -11,6 +11,7 @@ import {
   Volume2,
 } from 'lucide-react';
 import { useMemo, useRef, useState } from 'react';
+import { isZipBackupUrl, resolvePlayableUrl } from '../services/assetSource';
 import { type FullCatalog, queryAudio } from '../services/catalogEngine';
 import { downloadCustomRequestZip, type ZipProgress } from '../services/clientZipper';
 import type { AudioRecord } from '../types';
@@ -48,7 +49,7 @@ export function AudioView({ catalog, queuedIds, onToggleQueue }: AudioViewProps)
     [catalog, q, category, page]
   );
 
-  const handlePlayToggle = (track: AudioRecord) => {
+  const handlePlayToggle = async (track: AudioRecord) => {
     const el = audioRef.current;
     if (!el) return;
 
@@ -64,10 +65,30 @@ export function AudioView({ catalog, queuedIds, onToggleQueue }: AudioViewProps)
     }
 
     setActiveTrack(track);
-    el.src = resolveCdnUrl(cdnBase, track.url);
+    const rawUrl = resolveCdnUrl(cdnBase, track.url);
+    const playable = await resolvePlayableUrl(rawUrl);
+    if (!playable) {
+      setIsPlaying(false);
+      return;
+    }
+    el.src = playable;
     el.play()
       .then(() => setIsPlaying(true))
       .catch(() => setIsPlaying(false));
+  };
+
+  const handleDownloadTrack = async (track: AudioRecord) => {
+    const rawUrl = resolveCdnUrl(cdnBase, track.url);
+    const resolved = isZipBackupUrl(rawUrl) ? await resolvePlayableUrl(rawUrl) : rawUrl;
+    if (!resolved) return;
+    const a = document.createElement('a');
+    a.href = resolved;
+    a.download = track.filename;
+    a.target = '_blank';
+    a.rel = 'noreferrer';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
   };
 
   const handleDownloadDubsPack = async () => {
@@ -172,16 +193,13 @@ export function AudioView({ catalog, queuedIds, onToggleQueue }: AudioViewProps)
             </div>
           </div>
 
-          <a
-            href={resolveCdnUrl(cdnBase, activeTrack.url)}
-            download={activeTrack.filename}
-            target="_blank"
-            rel="noreferrer"
+          <button
+            onClick={() => handleDownloadTrack(activeTrack)}
             className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-white bg-[#1F2536] hover:bg-[#2A3248] rounded-lg whitespace-nowrap"
           >
             <Download className="w-3.5 h-3.5" />
             Baixar MP3
-          </a>
+          </button>
         </div>
       )}
 
@@ -235,16 +253,13 @@ export function AudioView({ catalog, queuedIds, onToggleQueue }: AudioViewProps)
                     </td>
                     <td className="py-2.5 px-4 text-right whitespace-nowrap">
                       <div className="inline-flex items-center gap-1.5">
-                        <a
-                          href={resolveCdnUrl(cdnBase, aud.url)}
-                          download={aud.filename}
-                          target="_blank"
-                          rel="noreferrer"
+                        <button
+                          onClick={() => handleDownloadTrack(aud)}
                           className="p-2 text-[#9CA5B9] hover:text-white bg-[#1B202E] rounded-md"
                           title="Baixar MP3"
                         >
                           <Download className="w-3.5 h-3.5" />
-                        </a>
+                        </button>
                         <button
                           onClick={() => onToggleQueue(aud)}
                           className={`inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-md ${

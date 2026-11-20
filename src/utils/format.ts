@@ -16,6 +16,10 @@ export function formatNumber(n: number): string {
 
 export function resolveCdnUrl(cdnBase: string, relUrl: string | null | undefined): string {
   if (!relUrl) return '';
-  if (/^https?:\/\//i.test(relUrl)) return relUrl;
-  return `${cdnBase.replace(/\/?$/, '/')}${relUrl.replace(/^\/+/, '')}`;
+  if (/^(https?:|blob:|data:|zip-backup:)/i.test(relUrl)) return relUrl;
+  const cleanRel = relUrl.replace(/^\/+/, '');
+  if (cdnBase.startsWith('zip-backup://')) {
+    return `zip-backup://${cleanRel}`;
+  }
+  return `${cdnBase.replace(/\/?$/, '/')}${cleanRel}`;
 }

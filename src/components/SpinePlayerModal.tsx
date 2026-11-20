@@ -3,6 +3,7 @@ import {
   ChevronRight,
   Download,
   FileArchive,
+  Film,
   Layers,
   Pause,
   Play,
@@ -11,6 +12,7 @@ import {
   X,
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { loadImageWithFallback } from '../services/assetSource';
 import {
   type FullCatalog,
   inspectAnim2DLive,
@@ -27,6 +29,11 @@ import type {
 import { formatBytes } from '../utils/format';
 import { lockBodyScroll } from '../utils/scrollLock';
 import {
+  exportAnim2DFramesZip,
+  exportSpineAnimationFramesZip,
+  type FrameExportProgress,
+} from '../utils/spineExporter';
+import {
   type CompiledSpineSkeleton,
   compileSpineSkeleton,
   getAnimationDuration,
@@ -34,7 +41,7 @@ import {
 } from '../utils/spineRenderer';
 
 export type PlayerTarget =
-  | { mode: 'spine'; bundle: SpineBundle; title?: string }
+  | { mode: 'spine'; bundle: SpineBundle; title?: string; initialAnim?: string }
   | { mode: 'anim2d'; bundle: Anim2DBundle; title?: string };
 
 interface SpinePlayerModalProps {
@@ -45,32 +52,6 @@ interface SpinePlayerModalProps {
 
 type ViewTab = 'live' | 'frames' | 'sheet' | 'json';
 type BgMode = 'checker' | 'dark' | 'light';
-
-function loadImageWithFallback(url: string): Promise<HTMLImageElement | null> {
-  return new Promise((resolve) => {
-    const attempt = (src: string, triedFallback: boolean) => {
-      const img = new Image();
-      img.crossOrigin = 'anonymous';
-      img.referrerPolicy = 'no-referrer';
-      img.onload = () => resolve(img);
-      img.onerror = () => {
-        if (!triedFallback) {
-          if (/\.png(\?|$)/i.test(src)) {
-            attempt(src.replace(/\.png(\?|$)/i, '.webp$1'), true);
-            return;
-          }
-          if (/\.webp(\?|$)/i.test(src)) {
-            attempt(src.replace(/\.webp(\?|$)/i, '.png$1'), true);
-            return;
-          }
-        }
-        resolve(null);
-      };
-      img.src = src;
-    };
-    attempt(url, false);
-  });
-}
 
 export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalProps) {
   const [loading, setLoading] = useState(false);
@@ -90,6 +71,8 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
   const [spineTime, setSpineTime] = useState(0);
   const [activeSlotInfo, setActiveSlotInfo] = useState('');
   const [exportingZip, setExportingZip] = useState(false);
+  const [exportingFrames, setExportingFrames] = useState(false);
+  const [frameExportProgress, setFrameExportProgress] = useState<FrameExportProgress | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const spineTimeRef = useRef(0);
@@ -136,7 +119,14 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
           const data = await inspectSpineLive(cdnBase, b.jsonUrl, b.atlasUrl);
           if (cancelled) return;
           setSpineData(data);
+          const requestedAnim =
+            target!.mode === 'spine' && target!.initialAnim
+              ? data.animations.find(
+                  (a) => a.name.toLowerCase() === target!.initialAnim!.toLowerCase()
+                )?.name
+              : undefined;
           const defaultAnim =
+            requestedAnim ||
             data.animations.find((a) => /^idle$/i.test(a.name))?.name ||
             data.animations.find((a) => /^loop$/i.test(a.name))?.name ||
             data.animations[0]?.name ||
@@ -499,6 +489,45 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
     }
   };
 
+  const handleExportFramesZip = async () => {
+    if (exportingFrames || loadedImageCount === 0) return;
+    setExportingFrames(true);
+    setFrameExportProgress({ completed: 0, total: 1, stage: 'Preparando frames...' });
+    try {
+      if (isSpineMode && compiledSpine) {
+        await exportSpineAnimationFramesZip({
+          bundleName: target.bundle.name,
+          animName: selectedAnim || 'pose',
+          compiled: compiledSpine,
+          loadedImages,
+          zoom,
+          fps: 24,
+          frameSize: 480,
+          onProgress: (p) => setFrameExportProgress(p),
+        });
+      } else if (!isSpineMode && loadedImages.main && playableFrames.length > 0) {
+        await exportAnim2DFramesZip({
+          bundleName: target.bundle.name,
+          frames: playableFrames.map((f) => ({
+            label: f.label,
+            x: f.x,
+            y: f.y,
+            w: f.w,
+            h: f.h,
+            rotate: f.rotate,
+          })),
+          image: loadedImages.main,
+          onProgress: (p) => setFrameExportProgress(p),
+        });
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Erro ao exportar frames PNG.');
+    } finally {
+      setExportingFrames(false);
+      setFrameExportProgress(null);
+    }
+  };
+
   const stageBgClass =
     bgMode === 'checker'
       ? 'checkerboard-bg'
@@ -546,8 +575,28 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
               className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 text-xs font-medium text-[#E6E9F0] bg-[#1D2230] hover:bg-[#272E40] disabled:opacity-40 rounded-lg transition-colors whitespace-nowrap"
             >
               <Download className="w-3.5 h-3.5" />
-              <span className="hidden md:inline">Salvar Frame PNG</span>
-              <span className="md:hidden">PNG</span>
+              <span className="hidden lg:inline">Frame PNG</span>
+              <span className="lg:hidden">PNG</span>
+            </button>
+            <button
+              onClick={handleExportFramesZip}
+              disabled={
+                exportingFrames ||
+                loadedImageCount === 0 ||
+                (isSpineMode ? !compiledSpine : playableFrames.length === 0)
+              }
+              title="Exportar sequência de frames PNG + Sprite Sheet em ZIP"
+              className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 text-xs font-medium text-[#E6E9F0] bg-[#1D2230] hover:bg-[#2A3348] border border-[#2C344A] disabled:opacity-40 rounded-lg transition-colors whitespace-nowrap"
+            >
+              <Film className="w-3.5 h-3.5 text-[#F97316]" />
+              <span className="hidden md:inline">
+                {exportingFrames && frameExportProgress
+                  ? `${frameExportProgress.completed}/${frameExportProgress.total} frames...`
+                  : 'Frames + Sheet ZIP'}
+              </span>
+              <span className="md:hidden">
+                {exportingFrames ? '...' : 'Sheet'}
+              </span>
             </button>
             <button
               onClick={handleExportBundleZip}

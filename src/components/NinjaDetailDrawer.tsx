@@ -2,6 +2,7 @@ import {
   Check,
   Download,
   FileArchive,
+  Film,
   Play,
   Plus,
   Sparkles,
@@ -9,19 +10,101 @@ import {
   X,
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
+import { useResolvedAssetUrl } from '../services/assetSource';
 import type { FullCatalog } from '../services/catalogEngine';
 import { downloadCustomRequestZip, type ZipProgress } from '../services/clientZipper';
-import type { NinjaRecord, SpineBundle } from '../types';
+import type { AudioRecord, NinjaRecord, SpineBundle, VideoRecord } from '../types';
 import { formatBytes, resolveCdnUrl } from '../utils/format';
 import { lockBodyScroll } from '../utils/scrollLock';
 import { AssetImage } from './AssetImage';
+import { NinjaSkillShowcase } from './NinjaSkillShowcase';
+
+function DrawerVideoCard({ vid, cdnBase }: { vid: VideoRecord; cdnBase: string }) {
+  const src = useResolvedAssetUrl(resolveCdnUrl(cdnBase, vid.url));
+  return (
+    <div className="bg-[#151924] border border-[#222736] rounded-lg overflow-hidden flex flex-col">
+      {src ? (
+        <video
+          controls
+          preload="none"
+          playsInline
+          src={src}
+          className="w-full aspect-video bg-[#090B10] object-contain"
+        />
+      ) : (
+        <div className="w-full aspect-video bg-[#090B10] flex items-center justify-center text-xs text-[#7C859B]">
+          Carregando vídeo...
+        </div>
+      )}
+      <div className="px-3 py-2 border-t border-[#222736] flex items-center justify-between gap-2 text-xs">
+        <div className="flex items-center gap-1.5 min-w-0">
+          <Film className="w-3.5 h-3.5 text-[#F97316] shrink-0" />
+          <span className="font-mono text-white truncate" title={vid.filename}>
+            {vid.filename}
+          </span>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <span className="text-[11px] font-mono tabular-nums text-[#8E97AB]">
+            {formatBytes(vid.bytes)}
+          </span>
+          {src && (
+            <a
+              href={src}
+              download={vid.filename}
+              target="_blank"
+              rel="noreferrer"
+              className="text-[#9CA5B9] hover:text-white"
+              title="Baixar vídeo MP4"
+            >
+              <Download className="w-3.5 h-3.5" />
+            </a>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DrawerAudioCard({ aud, cdnBase }: { aud: AudioRecord; cdnBase: string }) {
+  const src = useResolvedAssetUrl(resolveCdnUrl(cdnBase, aud.url));
+  return (
+    <div className="p-3 bg-[#151924] border border-[#222736] rounded-lg flex flex-col gap-2">
+      <div className="flex items-center justify-between gap-2 text-xs">
+        <div className="flex items-center gap-2 min-w-0">
+          <Volume2 className="w-3.5 h-3.5 text-[#F97316] shrink-0" />
+          <span className="font-mono text-white truncate">{aud.filename}</span>
+          <span className="text-[#8E97AB] shrink-0">· {aud.categoryLabel}</span>
+        </div>
+        {src && (
+          <a
+            href={src}
+            download={aud.filename}
+            target="_blank"
+            rel="noreferrer"
+            className="text-[#9CA5B9] hover:text-white inline-flex items-center gap-1 shrink-0"
+          >
+            <Download className="w-3.5 h-3.5" />
+            MP3
+          </a>
+        )}
+      </div>
+      {src ? (
+        <audio controls preload="none" src={src} className="w-full h-8" />
+      ) : (
+        <div className="h-8 flex items-center text-[11px] text-[#7C859B]">
+          Preparando áudio do backup...
+        </div>
+      )}
+    </div>
+  );
+}
 
 interface NinjaDetailDrawerProps {
   ninja: NinjaRecord | null;
   catalog: FullCatalog;
   isQueued: boolean;
   onToggleQueue: (ninja: NinjaRecord) => void;
-  onInspectSpine: (bundle: SpineBundle, title: string) => void;
+  onInspectSpine: (bundle: SpineBundle, title: string, initialAnim?: string) => void;
   onClose: () => void;
 }
 
@@ -202,10 +285,9 @@ export function NinjaDetailDrawer({
 
               {ninja.nameBannerUrl && (
                 <div className="pt-2 border-t border-[#222736]">
-                  <img
+                  <AssetImage
                     src={resolveCdnUrl(cdnBase, ninja.nameBannerUrl)}
                     alt={`Banner PT-BR ${ninja.name}`}
-                    referrerPolicy="no-referrer"
                     className="h-9 object-contain"
                   />
                 </div>
@@ -213,13 +295,30 @@ export function NinjaDetailDrawer({
             </div>
           </div>
 
+          {/* Interactive Skill Icons & Live Animation Preview (like in-game!) */}
+          <section>
+            <div className="flex items-center justify-between gap-2 mb-3">
+              <h3 className="text-sm font-semibold text-white">
+                Habilidades ({ninja.skillSlots.length})
+              </h3>
+              <span className="text-xs text-[#7E879D]">
+                Clique nos ícones para ver a animação
+              </span>
+            </div>
+            <NinjaSkillShowcase
+              ninja={ninja}
+              cdnBase={cdnBase}
+              onOpenFullPlayer={onInspectSpine}
+            />
+          </section>
+
           {/* Spine Animations */}
           <section>
             <div className="flex items-center justify-between mb-3">
               <h3 className="text-sm font-semibold text-white">
                 Sprites Animados Spine ({ninja.spineBundles.length})
               </h3>
-              <span className="text-xs text-[#7E879D]">Clique para reproduzir e extrair frames</span>
+              <span className="text-xs text-[#7E879D]">Todas as faixas e extração</span>
             </div>
             {ninja.spineBundles.length === 0 ? (
               <div className="p-4 text-xs text-[#7E879D] bg-[#151924] border border-[#222736] rounded-lg">
@@ -252,16 +351,67 @@ export function NinjaDetailDrawer({
             )}
           </section>
 
-          {/* Skills / Techniques */}
-          <section>
-            <h3 className="text-sm font-semibold text-white mb-3">
-              Técnicas e Habilidades ({ninja.skills.length})
-            </h3>
-            {ninja.skills.length === 0 ? (
-              <div className="p-4 text-xs text-[#7E879D] bg-[#151924] border border-[#222736] rounded-lg">
-                Nenhuma descrição de técnica sobrescrita encontrada para este ID no módulo de estúdio.
+          {/* Linked Skill Visual Effects (Spine) */}
+          {ninja.linkedEffects.length > 0 && (
+            <section>
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-sm font-semibold text-white">
+                  Efeitos Visuais de Habilidades ({ninja.linkedEffects.length})
+                </h3>
+                <span className="text-xs text-[#7E879D]">Vínculo automático por personagem</span>
               </div>
-            ) : (
+              <div className="space-y-2">
+                {ninja.linkedEffects.map((eff) => (
+                  <div
+                    key={eff.id}
+                    className="flex items-center justify-between gap-3 px-4 py-3 bg-[#151924] border border-[#222736] rounded-lg"
+                  >
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <Sparkles className="w-3.5 h-3.5 text-[#F97316] shrink-0" />
+                        <span className="text-sm font-mono text-white truncate">{eff.name}</span>
+                      </div>
+                      <div className="text-xs text-[#8E97AB] font-mono tabular-nums mt-0.5">
+                        Efeito Spine 3.8 · {eff.allFiles.length} arquivos ·{' '}
+                        {formatBytes(eff.totalBytes)}
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => onInspectSpine(eff, `${ninja.name} · ${eff.name}`)}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-[#1F2536] hover:bg-[#EA580C] rounded-lg transition-colors whitespace-nowrap shrink-0"
+                    >
+                      <Play className="w-3.5 h-3.5" />
+                      Abrir Player
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {/* Linked Official Hero Videos (MP4) */}
+          {ninja.linkedVideos.length > 0 && (
+            <section>
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-sm font-semibold text-white">
+                  Vídeos de Esotérica e Close-Up ({ninja.linkedVideos.length})
+                </h3>
+                <span className="text-xs text-[#7E879D]">MP4 original do servidor CDN</span>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {ninja.linkedVideos.map((vid) => (
+                  <DrawerVideoCard key={vid.id} vid={vid} cdnBase={cdnBase} />
+                ))}
+              </div>
+            </section>
+          )}
+
+          {/* Detailed Techniques Table */}
+          {ninja.skills.length > 0 && (
+            <section>
+              <h3 className="text-sm font-semibold text-white mb-3">
+                Descrições Completas das Técnicas ({ninja.skills.length})
+              </h3>
               <div className="divide-y divide-[#1E2331] border border-[#222736] rounded-lg bg-[#151924]">
                 {ninja.skills.map((sk) => (
                   <div key={sk.id} className="p-4">
@@ -293,8 +443,8 @@ export function NinjaDetailDrawer({
                   </div>
                 ))}
               </div>
-            )}
-          </section>
+            </section>
+          )}
 
           {/* Linked Audio */}
           <section>
@@ -308,34 +458,7 @@ export function NinjaDetailDrawer({
             ) : (
               <div className="space-y-2">
                 {ninja.audioFiles.map((aud) => (
-                  <div
-                    key={aud.id}
-                    className="p-3 bg-[#151924] border border-[#222736] rounded-lg flex flex-col gap-2"
-                  >
-                    <div className="flex items-center justify-between gap-2 text-xs">
-                      <div className="flex items-center gap-2 min-w-0">
-                        <Volume2 className="w-3.5 h-3.5 text-[#F97316] shrink-0" />
-                        <span className="font-mono text-white truncate">{aud.filename}</span>
-                        <span className="text-[#8E97AB] shrink-0">· {aud.categoryLabel}</span>
-                      </div>
-                      <a
-                        href={resolveCdnUrl(cdnBase, aud.url)}
-                        download={aud.filename}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-[#9CA5B9] hover:text-white inline-flex items-center gap-1 shrink-0"
-                      >
-                        <Download className="w-3.5 h-3.5" />
-                        MP3
-                      </a>
-                    </div>
-                    <audio
-                      controls
-                      preload="none"
-                      src={resolveCdnUrl(cdnBase, aud.url)}
-                      className="w-full h-8"
-                    />
-                  </div>
+                  <DrawerAudioCard key={aud.id} aud={aud} cdnBase={cdnBase} />
                 ))}
               </div>
             )}

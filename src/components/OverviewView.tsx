@@ -1,8 +1,10 @@
 import {
   ArrowRight,
+  Cloud,
   Database,
   Download,
   FileArchive,
+  Lock,
   RefreshCw,
   Smartphone,
 } from 'lucide-react';
@@ -24,7 +26,10 @@ export type NavSection =
   | 'effects'
   | 'audio'
   | 'techniques'
-  | 'exporter';
+  | 'gallery'
+  | 'items'
+  | 'exporter'
+  | 'backup';
 
 interface OverviewViewProps {
   catalog: FullCatalog;
@@ -100,7 +105,21 @@ export function OverviewView({ catalog, syncing, onSync, onNavigate }: OverviewV
       title: 'Técnicas, Atributos e Estatísticas',
       folder: '00_banco_de_dados/',
       count: summary.counts.techniques,
-      detail: `${formatNumber(summary.counts.techniques)} descrições em PT-BR · ${formatNumber(summary.counts.items)} itens indexados`,
+      detail: `${formatNumber(summary.counts.techniques)} descrições em PT-BR · ${formatNumber(summary.counts.items)} itens catalogados`,
+    },
+    {
+      section: 'gallery',
+      title: 'Cenários, UI, Artes PT-BR e Fontes',
+      folder: '07_ui_mapas_e_fontes/',
+      count: summary.counts.visualAssets + summary.counts.fontAssets,
+      detail: `${formatNumber(summary.counts.visualAssets)} arenas, mapas vivos, títulos e artes PT-BR · ${formatNumber(summary.counts.fontAssets)} fontes (.ttf e dano)`,
+    },
+    {
+      section: 'items',
+      title: 'Itens, Ferramentas e Estados de Combate',
+      folder: '08_itens_e_estados/',
+      count: summary.counts.visualItems + summary.counts.statusEffects,
+      detail: `${formatNumber(summary.counts.statusEffects)} estados Spine 3.8 animáveis · ${formatNumber(summary.counts.visualItems)} ícones de itens, ferramentas e runas`,
     },
   ];
 
@@ -193,6 +212,13 @@ export function OverviewView({ catalog, syncing, onSync, onNavigate }: OverviewV
           >
             <Database className="w-3.5 h-3.5" />
             JSON Completo
+          </button>
+          <button
+            onClick={() => onNavigate('backup')}
+            className="inline-flex items-center gap-2 px-3.5 py-2.5 text-xs font-medium text-[#D7DCE8] bg-[#161A24] hover:bg-[#1F2534] border border-[#252B3B] rounded-lg transition-colors whitespace-nowrap"
+          >
+            <Cloud className="w-3.5 h-3.5 text-[#F97316]" />
+            Backup / Drive
           </button>
           <button
             onClick={() => onNavigate('exporter')}
@@ -302,6 +328,23 @@ export function OverviewView({ catalog, syncing, onSync, onNavigate }: OverviewV
             </table>
           </div>
         </div>
+
+        {summary.counts.encryptedTables > 0 && (
+          <div className="flex items-start gap-3 px-4 py-3 bg-[#10131C] border border-[#222736] rounded-xl text-xs text-[#98A1B5]">
+            <Lock className="w-4 h-4 text-[#F97316] shrink-0 mt-0.5" />
+            <div className="leading-relaxed">
+              <span className="text-white font-medium">
+                {formatNumber(summary.counts.encryptedTables)} tabelas binárias protegidas (pasta{' '}
+                <code className="font-mono text-[#FB923C]">d/*</code>):
+              </span>{' '}
+              os arquivos internos de balanceamento e diálogos do cliente são criptografados pelo
+              jogo via WebCrypto e, por segurança, não são quebrados nem descriptografados no site.
+              Eles continuam preservados na íntegra dentro do pacote completo de 12,8 GB no
+              Exportador ZIP, enquanto 100% dos metadados públicos e coleções visuais do CDN já
+              estão indexados e pesquisáveis acima.
+            </div>
+          </div>
+        )}
       </section>
 
       {/* Quick Organized ZIP Packs */}

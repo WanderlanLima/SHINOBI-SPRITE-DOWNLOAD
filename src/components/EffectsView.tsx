@@ -1,11 +1,76 @@
 import { Check, ChevronLeft, ChevronRight, Download, Play, Plus, Search } from 'lucide-react';
 import { useMemo, useState } from 'react';
+import { triggerAssetDownload, useResolvedAssetUrl } from '../services/assetSource';
 import { type FullCatalog, paginateList } from '../services/catalogEngine';
 import type { Anim2DBundle, AssetFileRef, SpineBundle, VideoRecord } from '../types';
 import { formatBytes, formatNumber, resolveCdnUrl } from '../utils/format';
 import { AssetImage } from './AssetImage';
 
 type EffectTab = 'spine_effects' | 'anim2d' | 'videos' | 'icons';
+
+function EffectVideoCard({
+  vid,
+  cdnBase,
+  queued,
+  onToggleQueue,
+}: {
+  vid: VideoRecord;
+  cdnBase: string;
+  queued: boolean;
+  onToggleQueue: (video: VideoRecord) => void;
+}) {
+  const rawUrl = resolveCdnUrl(cdnBase, vid.url);
+  const playableUrl = useResolvedAssetUrl(rawUrl);
+
+  return (
+    <div className="bg-[#13161F] border border-[#222736] rounded-xl overflow-hidden flex flex-col">
+      <div className="aspect-video bg-black">
+        {playableUrl ? (
+          <video
+            controls
+            playsInline
+            preload="metadata"
+            src={playableUrl}
+            className="w-full h-full object-contain"
+          />
+        ) : (
+          <div className="w-full h-full flex items-center justify-center text-xs text-[#7C859B]">
+            Carregando vídeo...
+          </div>
+        )}
+      </div>
+      <div className="p-3.5 flex items-center justify-between gap-2">
+        <div className="min-w-0">
+          <div className="text-xs font-mono text-white truncate">{vid.filename}</div>
+          <div className="text-[11px] font-mono tabular-nums text-[#8E97AB] mt-0.5">
+            {vid.kind === 'esoterica' ? 'Esotérica' : 'Close-up'} · {formatBytes(vid.bytes)}
+          </div>
+        </div>
+        <div className="flex items-center gap-1.5 shrink-0">
+          <button
+            type="button"
+            onClick={() => triggerAssetDownload(rawUrl, vid.filename)}
+            className="p-1.5 text-[#9CA5B9] hover:text-white bg-[#1B202E] rounded-md"
+            title="Baixar MP4"
+          >
+            <Download className="w-3.5 h-3.5" />
+          </button>
+          <button
+            onClick={() => onToggleQueue(vid)}
+            className={`inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-md ${
+              queued
+                ? 'bg-[#16A34A]/20 text-[#86EFAC]'
+                : 'bg-[#1B202E] text-[#D7DCE8] hover:bg-[#262D40]'
+            }`}
+          >
+            {queued ? <Check className="w-3 h-3" /> : <Plus className="w-3 h-3" />}
+            {queued ? 'Na Fila' : 'ZIP'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 interface EffectsViewProps {
   catalog: FullCatalog;
@@ -213,70 +278,25 @@ export function EffectsView({
         </div>
       ) : tab === 'videos' ? (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {(data.items as VideoRecord[]).map((vid) => {
-            const queued = queuedVideoIds.has(vid.id);
-            const fullUrl = resolveCdnUrl(cdnBase, vid.url);
-            return (
-              <div
-                key={vid.id}
-                className="bg-[#13161F] border border-[#222736] rounded-xl overflow-hidden flex flex-col"
-              >
-                <div className="aspect-video bg-black">
-                  <video
-                    controls
-                    playsInline
-                    preload="metadata"
-                    src={fullUrl}
-                    className="w-full h-full object-contain"
-                  />
-                </div>
-                <div className="p-3.5 flex items-center justify-between gap-2">
-                  <div className="min-w-0">
-                    <div className="text-xs font-mono text-white truncate">{vid.filename}</div>
-                    <div className="text-[11px] font-mono tabular-nums text-[#8E97AB] mt-0.5">
-                      {vid.kind === 'esoterica' ? 'Esotérica' : 'Close-up'} ·{' '}
-                      {formatBytes(vid.bytes)}
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-1.5 shrink-0">
-                    <a
-                      href={fullUrl}
-                      download={vid.filename}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="p-1.5 text-[#9CA5B9] hover:text-white bg-[#1B202E] rounded-md"
-                      title="Baixar MP4"
-                    >
-                      <Download className="w-3.5 h-3.5" />
-                    </a>
-                    <button
-                      onClick={() => onToggleVideoQueue(vid)}
-                      className={`inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-md ${
-                        queued
-                          ? 'bg-[#16A34A]/20 text-[#86EFAC]'
-                          : 'bg-[#1B202E] text-[#D7DCE8] hover:bg-[#262D40]'
-                      }`}
-                    >
-                      {queued ? <Check className="w-3 h-3" /> : <Plus className="w-3 h-3" />}
-                      {queued ? 'Na Fila' : 'ZIP'}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            );
-          })}
+          {(data.items as VideoRecord[]).map((vid) => (
+            <EffectVideoCard
+              key={vid.id}
+              vid={vid}
+              cdnBase={cdnBase}
+              queued={queuedVideoIds.has(vid.id)}
+              onToggleQueue={onToggleVideoQueue}
+            />
+          ))}
         </div>
       ) : (
         <div className="grid grid-cols-4 sm:grid-cols-6 md:grid-cols-8 lg:grid-cols-10 gap-3">
           {(data.items as AssetFileRef[]).map((icon) => {
             const fullUrl = resolveCdnUrl(cdnBase, icon.url);
             return (
-              <a
+              <button
                 key={icon.url}
-                href={fullUrl}
-                target="_blank"
-                rel="noreferrer"
-                download={icon.name}
+                type="button"
+                onClick={() => triggerAssetDownload(fullUrl, icon.name)}
                 title={`${icon.name} (${formatBytes(icon.bytes)})`}
                 className="bg-[#13161F] border border-[#222736] hover:border-[#EA580C] rounded-lg p-2 flex flex-col items-center gap-1.5 transition-colors"
               >
@@ -286,7 +306,7 @@ export function EffectsView({
                 <span className="text-[10px] font-mono text-[#8E97AB] truncate w-full text-center">
                   {icon.name.replace(/\.webp$/i, '')}
                 </span>
-              </a>
+              </button>
             );
           })}
         </div>

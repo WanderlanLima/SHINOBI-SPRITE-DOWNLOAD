@@ -1,5 +1,6 @@
 import { ImageOff } from 'lucide-react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { isZipBackupUrl, useResolvedAssetUrl } from '../services/assetSource';
 
 interface AssetImageProps {
   src: string;
@@ -16,9 +17,24 @@ export function AssetImage({
   fallbackLabel,
   checkerboard = false,
 }: AssetImageProps) {
+  const resolvedSrc = useResolvedAssetUrl(src);
   const [failed, setFailed] = useState(false);
 
-  if (!src || failed) {
+  useEffect(() => {
+    setFailed(false);
+  }, [src, resolvedSrc]);
+
+  const waitingForZip = Boolean(src && isZipBackupUrl(src) && !resolvedSrc);
+
+  if (waitingForZip) {
+    return (
+      <div
+        className={`animate-pulse bg-[#141824] ${checkerboard ? 'checkerboard-bg' : ''} ${className}`}
+      />
+    );
+  }
+
+  if (!resolvedSrc || failed) {
     return (
       <div
         className={`flex flex-col items-center justify-center gap-1.5 bg-[#11141C] text-[#6B7387] select-none ${
@@ -37,7 +53,7 @@ export function AssetImage({
 
   return (
     <img
-      src={src}
+      src={resolvedSrc}
       alt={alt}
       loading="lazy"
       referrerPolicy="no-referrer"

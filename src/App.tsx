@@ -1,10 +1,13 @@
 import {
   BookOpen,
+  Cloud,
   FileArchive,
   Flame,
+  Image as ImageIcon,
   LayoutDashboard,
   Layers,
   Menu,
+  Package,
   Sparkles,
   Users,
   Volume2,
@@ -12,7 +15,9 @@ import {
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { AudioView } from './components/AudioView';
+import { BackupSourceView } from './components/BackupSourceView';
 import { EffectsView } from './components/EffectsView';
+import { ItemsStatusView } from './components/ItemsStatusView';
 import { NinjaDetailDrawer } from './components/NinjaDetailDrawer';
 import { NinjasView } from './components/NinjasView';
 import { type NavSection, OverviewView } from './components/OverviewView';
@@ -20,7 +25,13 @@ import { type PlayerTarget, SpinePlayerModal } from './components/SpinePlayerMod
 import { SpinesView } from './components/SpinesView';
 import { SummonsView } from './components/SummonsView';
 import { TechniquesView } from './components/TechniquesView';
+import { VisualGalleryView } from './components/VisualGalleryView';
 import { ZipExporterView } from './components/ZipExporterView';
+import {
+  type ActiveBackupInfo,
+  clearActiveZipBackup,
+  getActiveBackupInfo,
+} from './services/assetSource';
 import { type FullCatalog, loadStaticCatalog } from './services/catalogEngine';
 import type {
   Anim2DBundle,
@@ -41,7 +52,10 @@ const SECTION_TITLES: Record<NavSection, string> = {
   effects: 'Habilidades e Efeitos',
   audio: 'Sons e Dublagens',
   techniques: 'Técnicas e Atributos',
+  gallery: 'Cenários, UI e Fontes',
+  items: 'Itens e Estados',
   exporter: 'Exportador ZIP',
+  backup: 'Backup / Google Drive',
 };
 
 export default function App() {
@@ -57,12 +71,18 @@ export default function App() {
   const [selectedNinja, setSelectedNinja] = useState<NinjaRecord | null>(null);
   const [playerTarget, setPlayerTarget] = useState<PlayerTarget | null>(null);
   const [queue, setQueue] = useState<ZipExportItem[]>([]);
+  const [activeSource, setActiveSource] = useState<ActiveBackupInfo>(() => getActiveBackupInfo());
+  const [exporterInitialMode, setExporterInitialMode] = useState<
+    'mobile_full' | 'single_mirror' | 'custom'
+  >('mobile_full');
 
   const loadCatalog = useCallback(async (isReload = false) => {
     if (isReload) setSyncing(true);
     else setLoadingCatalog(true);
     setFatalError(null);
     try {
+      clearActiveZipBackup();
+      setActiveSource(getActiveBackupInfo());
       const cat = await loadStaticCatalog((stage) => setLoadingStage(stage));
       setCatalog(cat);
     } catch (e) {
@@ -77,6 +97,24 @@ export default function App() {
 
   useEffect(() => {
     loadCatalog(false);
+  }, [loadCatalog]);
+
+  const handleCatalogLoadedFromBackup = useCallback(
+    (nextCatalog: FullCatalog, sourceInfo: ActiveBackupInfo) => {
+      setSelectedNinja(null);
+      setPlayerTarget(null);
+      setFatalError(null);
+      setCatalog(nextCatalog);
+      setActiveSource(sourceInfo);
+      setSection('overview');
+    },
+    []
+  );
+
+  const handleRestoreLiveCdn = useCallback(() => {
+    setSelectedNinja(null);
+    setPlayerTarget(null);
+    loadCatalog(true);
   }, [loadCatalog]);
 
   const toggleQueueItem = useCallback((item: ZipExportItem) => {
@@ -206,10 +244,27 @@ export default function App() {
       count: summary?.counts.techniques,
     },
     {
+      key: 'gallery',
+      label: 'Cenários, UI e Fontes',
+      icon: ImageIcon,
+      count: summary ? summary.counts.visualAssets + summary.counts.fontAssets : undefined,
+    },
+    {
+      key: 'items',
+      label: 'Itens e Estados',
+      icon: Package,
+      count: summary ? summary.counts.visualItems + summary.counts.statusEffects : undefined,
+    },
+    {
       key: 'exporter',
       label: 'Exportador ZIP',
       icon: FileArchive,
       count: queue.length || undefined,
+    },
+    {
+      key: 'backup',
+      label: 'Backup / Google Drive',
+      icon: Cloud,
     },
   ];
 
@@ -266,10 +321,13 @@ export default function App() {
         </nav>
 
         <div className="p-4 border-t border-[#1E2331] text-[11px] text-[#7C859B] space-y-1">
-          <div className="font-mono truncate">naruto.jotagame.com</div>
+          <div className="font-mono truncate" title={activeSource.label}>
+            {activeSource.mode === 'cdn' ? 'naruto.jotagame.com' : activeSource.label}
+          </div>
           {summary && (
             <div className="font-mono tabular-nums">
-              {formatNumber(summary.totalFiles)} arquivos · 100% Estático
+              {formatNumber(summary.totalFiles)} arquivos ·{' '}
+              {activeSource.mode === 'cdn' ? 'CDN Oficial' : 'Backup ZIP'}
             </div>
           )}
         </div>
@@ -351,6 +409,16 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2.5 shrink-0">
+            {activeSource.mode !== 'cdn' && (
+              <button
+                onClick={() => handleSelectNav('backup')}
+                title={activeSource.label}
+                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-[#86EFAC] bg-[#16A34A]/15 border border-[#16A34A]/40 hover:bg-[#16A34A]/25 rounded-lg transition-colors whitespace-nowrap shrink-0"
+              >
+                <Cloud className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Backup Ativo</span>
+              </button>
+            )}
             <button
               onClick={() => handleSelectNav('exporter')}
               className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium text-white bg-[#EA580C] hover:bg-[#C2410C] rounded-lg transition-colors whitespace-nowrap shrink-0"
@@ -362,7 +430,17 @@ export default function App() {
         </header>
 
         <main className="flex-1 p-4 sm:p-6 lg:p-8 max-w-[1440px] w-full mx-auto">
-          {loadingCatalog ? (
+          {section === 'backup' ? (
+            <BackupSourceView
+              activeSource={activeSource}
+              onCatalogLoaded={handleCatalogLoadedFromBackup}
+              onRestoreLiveCdn={handleRestoreLiveCdn}
+              onGoToSingleExport={() => {
+                setExporterInitialMode('single_mirror');
+                handleSelectNav('exporter');
+              }}
+            />
+          ) : loadingCatalog ? (
             <div className="py-24 text-center space-y-3">
               <div className="text-sm font-medium text-white">{loadingStage}</div>
               <p className="text-xs text-[#8E97AB]">
@@ -370,16 +448,30 @@ export default function App() {
               </p>
             </div>
           ) : fatalError || !catalog ? (
-            <div className="p-6 bg-[#1F1215] border border-[#4C1D24] rounded-xl text-center space-y-3">
+            <div className="p-6 bg-[#1F1215] border border-[#4C1D24] rounded-xl text-center space-y-4 max-w-xl mx-auto">
               <p className="text-sm text-[#FCA5A5]">
-                {fatalError || 'Não foi possível carregar o catálogo.'}
+                {fatalError || 'Não foi possível carregar o catálogo oficial.'}
               </p>
-              <button
-                onClick={() => loadCatalog(false)}
-                className="px-4 py-2 text-xs font-medium text-white bg-[#EA580C] hover:bg-[#C2410C] rounded-lg"
-              >
-                Tentar Novamente
-              </button>
+              <p className="text-xs text-[#C9D1E1] leading-relaxed">
+                Se o servidor oficial de naruto.jotagame.com estiver fora do ar ou bloqueado, você
+                pode alimentar toda a aplicação usando seu arquivo ZIP único salvo no Google Drive ou
+                no dispositivo.
+              </p>
+              <div className="flex flex-wrap items-center justify-center gap-2.5 pt-1">
+                <button
+                  onClick={() => loadCatalog(false)}
+                  className="px-4 py-2 text-xs font-medium text-white bg-[#1D2230] hover:bg-[#262D40] border border-[#2E364D] rounded-lg transition-colors"
+                >
+                  Tentar Novamente
+                </button>
+                <button
+                  onClick={() => handleSelectNav('backup')}
+                  className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium text-white bg-[#EA580C] hover:bg-[#C2410C] rounded-lg transition-colors"
+                >
+                  <Cloud className="w-3.5 h-3.5" />
+                  Carregar Backup ZIP (Google Drive / Local)
+                </button>
+              </div>
             </div>
           ) : (
             <>
@@ -456,14 +548,29 @@ export default function App() {
                 <TechniquesView catalog={catalog} onOpenNinjaById={handleOpenNinjaById} />
               )}
 
+              {section === 'gallery' && <VisualGalleryView catalog={catalog} />}
+
+              {section === 'items' && (
+                <ItemsStatusView
+                  catalog={catalog}
+                  queuedSpineIds={queuedSpineIds}
+                  onToggleSpineQueue={handleToggleSpine}
+                  onInspectSpine={(bundle, title) =>
+                    setPlayerTarget({ mode: 'spine', bundle, title })
+                  }
+                />
+              )}
+
               {section === 'exporter' && (
                 <ZipExporterView
                   catalog={catalog}
                   queue={queue}
+                  initialMode={exporterInitialMode}
                   onRemoveItem={(type, id) =>
                     setQueue((prev) => prev.filter((x) => !(x.type === type && x.id === id)))
                   }
                   onClearQueue={() => setQueue([])}
+                  onGoToBackupSource={() => handleSelectNav('backup')}
                 />
               )}
             </>
@@ -478,7 +585,9 @@ export default function App() {
             catalog={catalog}
             isQueued={selectedNinja ? queuedNinjaIds.has(selectedNinja.id) : false}
             onToggleQueue={handleToggleNinja}
-            onInspectSpine={(bundle, title) => setPlayerTarget({ mode: 'spine', bundle, title })}
+            onInspectSpine={(bundle, title, initialAnim) =>
+              setPlayerTarget({ mode: 'spine', bundle, title, initialAnim })
+            }
             onClose={() => setSelectedNinja(null)}
           />
 
