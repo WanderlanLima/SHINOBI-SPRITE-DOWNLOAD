@@ -8,11 +8,12 @@ import {
   Volume2,
   X,
 } from 'lucide-react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { FullCatalog } from '../services/catalogEngine';
 import { downloadCustomRequestZip, type ZipProgress } from '../services/clientZipper';
 import type { NinjaRecord, SpineBundle } from '../types';
 import { formatBytes, resolveCdnUrl } from '../utils/format';
+import { lockBodyScroll } from '../utils/scrollLock';
 import { AssetImage } from './AssetImage';
 
 interface NinjaDetailDrawerProps {
@@ -35,6 +36,11 @@ export function NinjaDetailDrawer({
   const [downloading, setDownloading] = useState(false);
   const [progress, setProgress] = useState<ZipProgress | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!ninja) return;
+    return lockBodyScroll();
+  }, [ninja]);
 
   if (!ninja) return null;
 
@@ -71,11 +77,11 @@ export function NinjaDetailDrawer({
 
   return (
     <div
-      className="fixed inset-0 z-40 flex justify-end bg-black/65"
+      className="fixed inset-0 z-40 flex justify-end bg-black/65 overscroll-contain"
       onClick={onClose}
     >
       <div
-        className="w-full max-w-2xl h-full bg-[#11141C] border-l border-[#222736] flex flex-col overflow-hidden"
+        className="w-full max-w-2xl h-full bg-[#11141C] border-l border-[#222736] flex flex-col overflow-hidden overscroll-contain"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -151,7 +157,7 @@ export function NinjaDetailDrawer({
         </div>
 
         {/* Scrollable Content */}
-        <div className="flex-1 overflow-y-auto px-6 py-5 space-y-7">
+        <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y px-6 py-5 space-y-7">
           {/* Hero Visual + Name Banner */}
           <div className="grid grid-cols-1 sm:grid-cols-5 gap-4 items-stretch">
             <div className="sm:col-span-2 aspect-square rounded-lg border border-[#222736] checkerboard-bg overflow-hidden p-2">

@@ -7,6 +7,7 @@ import {
   Pause,
   Play,
   RotateCcw,
+  Search,
   X,
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -24,6 +25,13 @@ import type {
   SpineInspectionResult,
 } from '../types';
 import { formatBytes } from '../utils/format';
+import { lockBodyScroll } from '../utils/scrollLock';
+import {
+  type CompiledSpineSkeleton,
+  compileSpineSkeleton,
+  getAnimationDuration,
+  renderSpineAtTime,
+} from '../utils/spineRenderer';
 
 export type PlayerTarget =
   | { mode: 'spine'; bundle: SpineBundle; title?: string }
@@ -38,6 +46,32 @@ interface SpinePlayerModalProps {
 type ViewTab = 'live' | 'frames' | 'sheet' | 'json';
 type BgMode = 'checker' | 'dark' | 'light';
 
+function loadImageWithFallback(url: string): Promise<HTMLImageElement | null> {
+  return new Promise((resolve) => {
+    const attempt = (src: string, triedFallback: boolean) => {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.referrerPolicy = 'no-referrer';
+      img.onload = () => resolve(img);
+      img.onerror = () => {
+        if (!triedFallback) {
+          if (/\.png(\?|$)/i.test(src)) {
+            attempt(src.replace(/\.png(\?|$)/i, '.webp$1'), true);
+            return;
+          }
+          if (/\.webp(\?|$)/i.test(src)) {
+            attempt(src.replace(/\.webp(\?|$)/i, '.png$1'), true);
+            return;
+          }
+        }
+        resolve(null);
+      };
+      img.src = src;
+    };
+    attempt(url, false);
+  });
+}
+
 export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -47,14 +81,35 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
 
   const [viewTab, setViewTab] = useState<ViewTab>('live');
   const [selectedAnim, setSelectedAnim] = useState<string>('');
+  const [trackSearch, setTrackSearch] = useState('');
   const [playing, setPlaying] = useState(true);
   const [speed, setSpeed] = useState(1);
   const [zoom, setZoom] = useState(1);
   const [bgMode, setBgMode] = useState<BgMode>('checker');
   const [frameIndex, setFrameIndex] = useState(0);
+  const [spineTime, setSpineTime] = useState(0);
+  const [activeSlotInfo, setActiveSlotInfo] = useState('');
   const [exportingZip, setExportingZip] = useState(false);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const spineTimeRef = useRef(0);
+  const lastRafRef = useRef<number | null>(null);
+
+  // Lock background page scroll while modal is open
+  useEffect(() => {
+    if (!target) return;
+    return lockBodyScroll();
+  }, [target]);
+
+  // Close on Escape key
+  useEffect(() => {
+    if (!target) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [target, onClose]);
 
   useEffect(() => {
     if (!target) return;
@@ -65,8 +120,13 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
     setAnim2dData(null);
     setLoadedImages({});
     setFrameIndex(0);
+    setSpineTime(0);
+    spineTimeRef.current = 0;
+    setActiveSlotInfo('');
+    setTrackSearch('');
     setViewTab('live');
     setPlaying(true);
+    setZoom(1);
 
     async function load() {
       try {
@@ -77,25 +137,18 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
           if (cancelled) return;
           setSpineData(data);
           const defaultAnim =
-            data.animations.find((a) => /^idle$/i.test(a.name))?.name || data.animations[0]?.name || '';
+            data.animations.find((a) => /^idle$/i.test(a.name))?.name ||
+            data.animations.find((a) => /^loop$/i.test(a.name))?.name ||
+            data.animations[0]?.name ||
+            '';
           setSelectedAnim(defaultAnim);
 
           const imgs: Record<string, HTMLImageElement> = {};
           await Promise.all(
-            data.pages.map(
-              (page) =>
-                new Promise<void>((resolve) => {
-                  const img = new Image();
-                  img.crossOrigin = 'anonymous';
-                  img.referrerPolicy = 'no-referrer';
-                  img.onload = () => {
-                    imgs[page.filename] = img;
-                    resolve();
-                  };
-                  img.onerror = () => resolve();
-                  img.src = page.imageUrl;
-                })
-            )
+            data.pages.map(async (page) => {
+              const img = await loadImageWithFallback(page.imageUrl);
+              if (img) imgs[page.filename] = img;
+            })
           );
           if (!cancelled) setLoadedImages(imgs);
         } else {
@@ -105,17 +158,8 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
           setAnim2dData(data);
 
           if (data.imageUrl) {
-            await new Promise<void>((resolve) => {
-              const img = new Image();
-              img.crossOrigin = 'anonymous';
-              img.referrerPolicy = 'no-referrer';
-              img.onload = () => {
-                if (!cancelled) setLoadedImages({ main: img });
-                resolve();
-              };
-              img.onerror = () => resolve();
-              img.src = data.imageUrl;
-            });
+            const img = await loadImageWithFallback(data.imageUrl);
+            if (!cancelled && img) setLoadedImages({ main: img });
           }
         }
       } catch (e) {
@@ -131,7 +175,18 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
     };
   }, [target, catalog.summary.cdnBase]);
 
-  // Compute playable frame sequence for current selection
+  // Compile Spine skeleton for real-time 60fps skeletal playback
+  const compiledSpine = useMemo<CompiledSpineSkeleton | null>(() => {
+    if (target?.mode !== 'spine' || !spineData?.rawSkeleton) return null;
+    return compileSpineSkeleton(spineData.rawSkeleton, spineData.regions);
+  }, [target?.mode, spineData]);
+
+  const currentSpineDuration = useMemo(() => {
+    if (!compiledSpine || !selectedAnim) return 0;
+    return getAnimationDuration(compiledSpine, selectedAnim);
+  }, [compiledSpine, selectedAnim]);
+
+  // Compute extracted region/frame list (used for Anim2D playback, Frames tab, and fallback)
   const playableFrames = useMemo(() => {
     if (target?.mode === 'anim2d' && anim2dData) {
       return anim2dData.frames.map((f, idx) => ({
@@ -173,7 +228,6 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
       }> = [];
 
       if (anim && anim.attachmentFrames.length > 0) {
-        // Resolve unique attachment frames in chronological order
         for (const af of anim.attachmentFrames) {
           if (!af.attachment) continue;
           const reg = regionMap.get(af.attachment);
@@ -195,7 +249,6 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
         }
       }
 
-      // Fallback: if the animation drives skeletal bones without frame attachments, cycle all atlas regions
       if (frames.length === 0 && spineData.regions.length > 0) {
         const sorted = [...spineData.regions].sort((a, b) =>
           a.name.localeCompare(b.name, undefined, { numeric: true })
@@ -225,30 +278,21 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
     return [];
   }, [target, spineData, anim2dData, selectedAnim]);
 
-  // Playback loop
-  useEffect(() => {
-    if (!playing || playableFrames.length <= 1 || viewTab !== 'live') return;
-    const baseFps = target?.mode === 'anim2d' ? 15 : 12;
-    const intervalMs = Math.max(24, Math.round(1000 / (baseFps * speed)));
-    const timer = window.setInterval(() => {
-      setFrameIndex((prev) => (prev + 1) % playableFrames.length);
-    }, intervalMs);
-    return () => window.clearInterval(timer);
-  }, [playing, playableFrames.length, speed, viewTab, target?.mode]);
+  const filteredAnimations = useMemo(() => {
+    if (!spineData) return [];
+    const q = trackSearch.trim().toLowerCase();
+    if (!q) return spineData.animations;
+    return spineData.animations.filter((a) => a.name.toLowerCase().includes(q));
+  }, [spineData, trackSearch]);
 
-  // Draw current frame onto HTML5 canvas
-  useEffect(() => {
-    if (viewTab !== 'live') return;
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    const W = canvas.width;
-    const H = canvas.height;
+  const drawFallbackFrame = (
+    ctx: CanvasRenderingContext2D,
+    idx: number
+  ) => {
+    const W = ctx.canvas.width;
+    const H = ctx.canvas.height;
     ctx.clearRect(0, 0, W, H);
-
-    const frame = playableFrames[frameIndex % Math.max(1, playableFrames.length)];
+    const frame = playableFrames[idx % Math.max(1, playableFrames.length)];
     if (!frame) return;
     const img = loadedImages[frame.page];
     if (!img) return;
@@ -266,18 +310,164 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
     ctx.scale(scale, scale);
 
     if (frame.rotate) {
-      // Spine atlas 90° clockwise rotation compensation
       ctx.rotate(-Math.PI / 2);
       ctx.drawImage(img, frame.x, frame.y, srcW, srcH, -srcW / 2, -srcH / 2, srcW, srcH);
     } else {
       ctx.drawImage(img, frame.x, frame.y, srcW, srcH, -drawW / 2, -drawH / 2, drawW, drawH);
     }
     ctx.restore();
-  }, [playableFrames, frameIndex, loadedImages, zoom, viewTab]);
+  };
+
+  // Real-time Spine 3.8 RAF loop
+  useEffect(() => {
+    if (target?.mode !== 'spine' || viewTab !== 'live' || !compiledSpine) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const hasImages = Object.keys(loadedImages).length > 0;
+    if (!hasImages) return;
+
+    const duration = currentSpineDuration;
+    let rafId = 0;
+    let lastUiSync = 0;
+    lastRafRef.current = null;
+
+    const renderFrame = (t: number) => {
+      const res = renderSpineAtTime(ctx, compiledSpine, selectedAnim, t, loadedImages, zoom);
+      if (res.drawnSlots === 0 && playableFrames.length > 0) {
+        const estIdx =
+          duration > 0
+            ? Math.floor((t / duration) * playableFrames.length) % playableFrames.length
+            : 0;
+        drawFallbackFrame(ctx, estIdx);
+      }
+      return res;
+    };
+
+    // Always draw immediately for current time
+    const initRes = renderFrame(spineTimeRef.current);
+    if (initRes.activeLabels.length > 0) {
+      setActiveSlotInfo(initRes.activeLabels.slice(0, 3).join(' · '));
+    }
+
+    if (!playing || duration <= 0) {
+      return;
+    }
+
+    const tick = (now: number) => {
+      if (lastRafRef.current === null) {
+        lastRafRef.current = now;
+      }
+      const dt = Math.min(0.1, (now - lastRafRef.current) / 1000) * speed;
+      lastRafRef.current = now;
+
+      let nextT = spineTimeRef.current + dt;
+      if (duration > 0 && nextT >= duration) {
+        nextT = nextT % duration;
+      }
+      spineTimeRef.current = nextT;
+
+      const res = renderFrame(nextT);
+
+      // Throttle React state updates to ~20fps so scrubber stays smooth without overhead
+      if (now - lastUiSync > 50) {
+        lastUiSync = now;
+        setSpineTime(nextT);
+        if (res.activeLabels.length > 0) {
+          setActiveSlotInfo(res.activeLabels.slice(0, 3).join(' · '));
+        }
+      }
+
+      rafId = window.requestAnimationFrame(tick);
+    };
+
+    rafId = window.requestAnimationFrame(tick);
+    return () => {
+      window.cancelAnimationFrame(rafId);
+      lastRafRef.current = null;
+    };
+  }, [
+    target?.mode,
+    viewTab,
+    compiledSpine,
+    selectedAnim,
+    currentSpineDuration,
+    loadedImages,
+    playing,
+    speed,
+    zoom,
+    playableFrames,
+  ]);
+
+  // Anim2D playback loop
+  useEffect(() => {
+    if (target?.mode !== 'anim2d' || !playing || playableFrames.length <= 1 || viewTab !== 'live') {
+      return;
+    }
+    const intervalMs = Math.max(24, Math.round(1000 / (15 * speed)));
+    const timer = window.setInterval(() => {
+      setFrameIndex((prev) => (prev + 1) % playableFrames.length);
+    }, intervalMs);
+    return () => window.clearInterval(timer);
+  }, [playing, playableFrames.length, speed, viewTab, target?.mode]);
+
+  // Anim2D canvas drawing
+  useEffect(() => {
+    if (target?.mode !== 'anim2d' || viewTab !== 'live') return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    drawFallbackFrame(ctx, frameIndex);
+  }, [target?.mode, playableFrames, frameIndex, loadedImages, zoom, viewTab]);
 
   if (!target) return null;
 
   const title = target.title || target.bundle.name;
+  const isSpineMode = target.mode === 'spine';
+  const loadedImageCount = Object.keys(loadedImages).length;
+
+  const handleStep = (dir: -1 | 1) => {
+    setPlaying(false);
+    if (isSpineMode && compiledSpine && currentSpineDuration > 0) {
+      const stepSec = 1 / Math.max(12, Math.min(30, compiledSpine.fps || 24));
+      let next = spineTimeRef.current + dir * stepSec;
+      if (next < 0) next = currentSpineDuration;
+      if (next > currentSpineDuration) next = 0;
+      spineTimeRef.current = next;
+      setSpineTime(next);
+      const canvas = canvasRef.current;
+      const ctx = canvas?.getContext('2d');
+      if (ctx) {
+        renderSpineAtTime(ctx, compiledSpine, selectedAnim, next, loadedImages, zoom);
+      }
+    } else if (playableFrames.length > 0) {
+      setFrameIndex((i) => (i + dir + playableFrames.length) % playableFrames.length);
+    }
+  };
+
+  const handleScrubSpine = (nextSec: number) => {
+    setPlaying(false);
+    spineTimeRef.current = nextSec;
+    setSpineTime(nextSec);
+    if (compiledSpine && canvasRef.current) {
+      const ctx = canvasRef.current.getContext('2d');
+      if (ctx) {
+        renderSpineAtTime(ctx, compiledSpine, selectedAnim, nextSec, loadedImages, zoom);
+      }
+    }
+  };
+
+  const handleSelectTrack = (animName: string) => {
+    setSelectedAnim(animName);
+    spineTimeRef.current = 0;
+    setSpineTime(0);
+    setFrameIndex(0);
+    setPlaying(true);
+    setViewTab('live');
+  };
 
   const handleSaveCurrentPng = () => {
     const canvas = canvasRef.current;
@@ -285,7 +475,10 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
     const url = canvas.toDataURL('image/png');
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${target.bundle.name}_frame_${frameIndex + 1}.png`;
+    const suffix = isSpineMode
+      ? `${selectedAnim || 'pose'}_${spineTime.toFixed(2)}s`
+      : `frame_${frameIndex + 1}`;
+    a.download = `${target.bundle.name}_${suffix}.png`;
     a.click();
   };
 
@@ -313,57 +506,64 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
       ? 'bg-[#EAECEF]'
       : 'bg-[#090B10]';
 
+  const hasTrackSidebar = isSpineMode && spineData && spineData.animations.length > 0;
+
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-0 sm:p-4 overscroll-contain"
       onClick={onClose}
     >
       <div
-        className="w-full max-w-5xl max-h-[92vh] bg-[#13161F] border border-[#252B3B] rounded-xl flex flex-col overflow-hidden"
+        className="w-full h-[100dvh] sm:h-[90vh] sm:max-w-5xl bg-[#13161F] sm:border sm:border-[#252B3B] sm:rounded-xl flex flex-col overflow-hidden overscroll-contain"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Top bar */}
-        <div className="flex items-center justify-between gap-4 px-5 py-3.5 border-b border-[#222736]">
+        <div className="shrink-0 flex items-center justify-between gap-3 px-4 sm:px-5 py-3 border-b border-[#222736]">
           <div className="min-w-0">
-            <h2 className="text-base font-semibold text-white truncate">{title}</h2>
-            <div className="flex items-center gap-2 text-xs text-[#8E97AB] font-mono tabular-nums mt-0.5">
-              <span>{target.mode === 'spine' ? 'Spine 3.8' : 'TexturePacker 2D'}</span>
-              <span aria-hidden="true">·</span>
-              <span>{target.bundle.allFiles.length} arquivos</span>
+            <h2 className="text-sm sm:text-base font-semibold text-white truncate">{title}</h2>
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] sm:text-xs text-[#8E97AB] font-mono tabular-nums mt-0.5">
+              <span>{isSpineMode ? 'Spine 3.8' : 'TexturePacker 2D'}</span>
               <span aria-hidden="true">·</span>
               <span>{formatBytes(target.bundle.totalBytes)}</span>
               {spineData && (
                 <>
                   <span aria-hidden="true">·</span>
-                  <span>{spineData.animations.length} animações</span>
-                  <span aria-hidden="true">·</span>
-                  <span>{spineData.regions.length} recortes</span>
+                  <span>{spineData.animations.length} faixas</span>
+                  <span className="hidden sm:inline" aria-hidden="true">
+                    ·
+                  </span>
+                  <span className="hidden sm:inline">{spineData.regions.length} recortes</span>
                 </>
               )}
             </div>
           </div>
 
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
             <button
               onClick={handleSaveCurrentPng}
-              disabled={viewTab !== 'live' || playableFrames.length === 0}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-[#E6E9F0] bg-[#1D2230] hover:bg-[#272E40] disabled:opacity-40 rounded-lg transition-colors whitespace-nowrap"
+              disabled={viewTab !== 'live' || loadedImageCount === 0}
+              title="Salvar frame atual em PNG"
+              className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 text-xs font-medium text-[#E6E9F0] bg-[#1D2230] hover:bg-[#272E40] disabled:opacity-40 rounded-lg transition-colors whitespace-nowrap"
             >
               <Download className="w-3.5 h-3.5" />
-              Salvar Frame PNG
+              <span className="hidden md:inline">Salvar Frame PNG</span>
+              <span className="md:hidden">PNG</span>
             </button>
             <button
               onClick={handleExportBundleZip}
               disabled={exportingZip}
-              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium text-white bg-[#EA580C] hover:bg-[#C2410C] disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap"
+              className="inline-flex items-center gap-1.5 px-2.5 sm:px-3.5 py-1.5 text-xs font-medium text-white bg-[#EA580C] hover:bg-[#C2410C] disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap"
             >
               <FileArchive className="w-3.5 h-3.5" />
-              {exportingZip ? 'Compactando...' : 'Baixar Pacote ZIP'}
+              <span className="hidden sm:inline">
+                {exportingZip ? 'Compactando...' : 'Baixar ZIP'}
+              </span>
+              <span className="sm:hidden">{exportingZip ? '...' : 'ZIP'}</span>
             </button>
             <button
               onClick={onClose}
               aria-label="Fechar player"
-              className="p-1.5 text-[#8E97AB] hover:text-white rounded-lg hover:bg-[#1D2230] transition-colors"
+              className="p-2 text-[#8E97AB] hover:text-white rounded-lg hover:bg-[#1D2230] transition-colors"
             >
               <X className="w-5 h-5" />
             </button>
@@ -371,12 +571,12 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
         </div>
 
         {/* Mode Switcher */}
-        <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-2.5 bg-[#0F1219] border-b border-[#222736]">
-          <div className="flex items-center gap-1 p-1 bg-[#161A25] rounded-lg">
+        <div className="shrink-0 flex items-center justify-between gap-3 px-4 sm:px-5 py-2 bg-[#0F1219] border-b border-[#222736] overflow-x-auto">
+          <div className="flex items-center gap-1 p-1 bg-[#161A25] rounded-lg shrink-0">
             {(
               [
                 ['live', 'Animação ao Vivo'],
-                ['frames', 'Frames Extraídos'],
+                ['frames', 'Frames'],
                 ['sheet', 'Sprite Sheet'],
                 ['json', 'Metadados'],
               ] as const
@@ -384,7 +584,7 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
               <button
                 key={key}
                 onClick={() => setViewTab(key)}
-                className={`px-3 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
+                className={`px-2.5 sm:px-3 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
                   viewTab === key
                     ? 'bg-[#EA580C] text-white'
                     : 'text-[#9CA5B9] hover:text-white'
@@ -396,8 +596,8 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
           </div>
 
           {viewTab === 'live' && (
-            <div className="flex items-center gap-3 text-xs text-[#9CA5B9]">
-              <div className="flex items-center gap-1 p-0.5 bg-[#161A25] rounded-md">
+            <div className="flex items-center gap-2.5 text-xs text-[#9CA5B9] shrink-0">
+              <div className="flex items-center gap-0.5 p-0.5 bg-[#161A25] rounded-md">
                 {(
                   [
                     ['checker', 'Xadrez'],
@@ -408,7 +608,7 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
                   <button
                     key={bg}
                     onClick={() => setBgMode(bg)}
-                    className={`px-2 py-1 rounded text-[11px] font-medium transition-colors ${
+                    className={`px-2 py-1 rounded text-[11px] font-medium transition-colors whitespace-nowrap ${
                       bgMode === bg ? 'bg-[#262D3F] text-white' : 'text-[#8E97AB] hover:text-white'
                     }`}
                   >
@@ -417,7 +617,7 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
                 ))}
               </div>
 
-              <label className="flex items-center gap-2">
+              <label className="hidden sm:flex items-center gap-2">
                 <span>Zoom</span>
                 <input
                   type="range"
@@ -436,60 +636,84 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
           )}
         </div>
 
-        {/* Main Body */}
-        <div className="flex-1 overflow-hidden flex flex-col lg:flex-row min-h-[420px]">
-          {/* Left Stage */}
-          <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
+        {/* Main Body: strictly bounded flex layout so Player NEVER collapses and Tracks scroll independently */}
+        <div className="flex-1 min-h-0 overflow-hidden flex flex-col lg:flex-row">
+          {/* Left / Top Stage */}
+          <div
+            className={
+              viewTab === 'live' && hasTrackSidebar
+                ? 'shrink-0 h-[44dvh] min-h-[250px] max-h-[420px] lg:h-auto lg:max-h-none lg:flex-1 lg:min-h-0 flex flex-col min-w-0 overflow-hidden'
+                : 'flex-1 min-h-0 flex flex-col min-w-0 overflow-hidden'
+            }
+          >
             {loading ? (
-              <div className="flex-1 flex items-center justify-center text-sm text-[#8E97AB]">
+              <div className="flex-1 flex items-center justify-center p-6 text-sm text-[#8E97AB] text-center">
                 Carregando skeleton e atlas do servidor CDN...
               </div>
             ) : error ? (
-              <div className="flex-1 flex items-center justify-center p-6 text-sm text-[#FCA5A5]">
+              <div className="flex-1 flex items-center justify-center p-6 text-sm text-[#FCA5A5] text-center">
                 {error}
               </div>
             ) : viewTab === 'live' ? (
               <>
-                <div className={`flex-1 relative flex items-center justify-center overflow-hidden ${stageBgClass}`}>
+                <div
+                  className={`flex-1 min-h-0 relative flex items-center justify-center overflow-hidden ${stageBgClass}`}
+                >
                   <canvas
                     ref={canvasRef}
                     width={720}
                     height={460}
-                    className="max-w-full max-h-[440px] object-contain"
+                    className="w-full h-full object-contain"
                   />
-                  {playableFrames.length > 0 && (
-                    <div className="absolute bottom-3 left-3 px-2.5 py-1 rounded bg-[#0B0D12]/85 border border-[#222736] text-[11px] font-mono tabular-nums text-[#C9D1E1]">
-                      Frame {(frameIndex % playableFrames.length) + 1}/{playableFrames.length} ·{' '}
-                      {playableFrames[frameIndex % playableFrames.length]?.label}
+
+                  {selectedAnim && isSpineMode && (
+                    <div className="absolute top-2.5 left-2.5 px-2.5 py-1 rounded bg-[#0B0D12]/85 border border-[#222736] text-[11px] font-mono text-white max-w-[75%] truncate">
+                      {selectedAnim}
                     </div>
+                  )}
+
+                  {loadedImageCount === 0 && (
+                    <div className="absolute inset-0 flex items-center justify-center p-4 text-center text-xs text-[#FCA5A5] bg-[#0B0D12]/70">
+                      Textura do atlas não encontrada neste servidor CDN.
+                    </div>
+                  )}
+
+                  {isSpineMode ? (
+                    <div className="absolute bottom-2.5 left-2.5 right-2.5 flex items-center justify-between gap-2 pointer-events-none">
+                      <div className="px-2.5 py-1 rounded bg-[#0B0D12]/85 border border-[#222736] text-[11px] font-mono tabular-nums text-[#C9D1E1] truncate">
+                        {spineTime.toFixed(2)}s / {currentSpineDuration.toFixed(2)}s
+                        {activeSlotInfo ? ` · ${activeSlotInfo}` : ''}
+                      </div>
+                    </div>
+                  ) : (
+                    playableFrames.length > 0 && (
+                      <div className="absolute bottom-2.5 left-2.5 px-2.5 py-1 rounded bg-[#0B0D12]/85 border border-[#222736] text-[11px] font-mono tabular-nums text-[#C9D1E1]">
+                        Frame {(frameIndex % playableFrames.length) + 1}/{playableFrames.length} ·{' '}
+                        {playableFrames[frameIndex % playableFrames.length]?.label}
+                      </div>
+                    )
                   )}
                 </div>
 
                 {/* Playback Controls */}
-                <div className="px-5 py-3 bg-[#10131B] border-t border-[#222736] flex flex-wrap items-center justify-between gap-3">
-                  <div className="flex items-center gap-2">
+                <div className="shrink-0 px-3 sm:px-5 py-2.5 bg-[#10131B] border-t border-[#222736] flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5">
                     <button
                       onClick={() => setPlaying((p) => !p)}
                       className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-[#1F2536] hover:bg-[#2A3248] rounded-lg transition-colors"
                     >
                       {playing ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
-                      {playing ? 'Pausar' : 'Reproduzir'}
+                      <span>{playing ? 'Pausar' : 'Play'}</span>
                     </button>
                     <button
-                      onClick={() => {
-                        setPlaying(false);
-                        setFrameIndex((i) => (i - 1 + playableFrames.length) % Math.max(1, playableFrames.length));
-                      }}
+                      onClick={() => handleStep(-1)}
                       aria-label="Frame anterior"
                       className="p-1.5 text-[#C9D1E1] bg-[#181C28] hover:bg-[#242A3B] rounded-lg"
                     >
                       <ChevronLeft className="w-4 h-4" />
                     </button>
                     <button
-                      onClick={() => {
-                        setPlaying(false);
-                        setFrameIndex((i) => (i + 1) % Math.max(1, playableFrames.length));
-                      }}
+                      onClick={() => handleStep(1)}
                       aria-label="Próximo frame"
                       className="p-1.5 text-[#C9D1E1] bg-[#181C28] hover:bg-[#242A3B] rounded-lg"
                     >
@@ -497,6 +721,8 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
                     </button>
                     <button
                       onClick={() => {
+                        spineTimeRef.current = 0;
+                        setSpineTime(0);
                         setFrameIndex(0);
                         setZoom(1);
                       }}
@@ -507,18 +733,31 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
                     </button>
                   </div>
 
-                  {playableFrames.length > 1 && (
+                  {isSpineMode && currentSpineDuration > 0 ? (
                     <input
                       type="range"
                       min={0}
-                      max={playableFrames.length - 1}
-                      value={frameIndex % playableFrames.length}
-                      onChange={(e) => {
-                        setPlaying(false);
-                        setFrameIndex(parseInt(e.target.value, 10));
-                      }}
-                      className="flex-1 min-w-[140px] accent-[#EA580C]"
+                      max={currentSpineDuration}
+                      step={0.01}
+                      value={Math.min(spineTime, currentSpineDuration)}
+                      onChange={(e) => handleScrubSpine(parseFloat(e.target.value))}
+                      className="flex-1 min-w-[100px] accent-[#EA580C]"
                     />
+                  ) : (
+                    !isSpineMode &&
+                    playableFrames.length > 1 && (
+                      <input
+                        type="range"
+                        min={0}
+                        max={playableFrames.length - 1}
+                        value={frameIndex % playableFrames.length}
+                        onChange={(e) => {
+                          setPlaying(false);
+                          setFrameIndex(parseInt(e.target.value, 10));
+                        }}
+                        className="flex-1 min-w-[100px] accent-[#EA580C]"
+                      />
+                    )
                   )}
 
                   <div className="flex items-center gap-1">
@@ -539,33 +778,37 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
                 </div>
               </>
             ) : viewTab === 'frames' ? (
-              <div className="flex-1 overflow-y-auto p-5">
-                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
-                  {playableFrames.slice(0, 80).map((f, idx) => (
+              <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y p-4 sm:p-5">
+                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2.5">
+                  {playableFrames.slice(0, 120).map((f, idx) => (
                     <button
                       key={`${f.label}-${idx}`}
                       onClick={() => {
-                        setFrameIndex(idx);
-                        setPlaying(false);
+                        if (isSpineMode) {
+                          handleScrubSpine(f.time);
+                        } else {
+                          setFrameIndex(idx);
+                          setPlaying(false);
+                        }
                         setViewTab('live');
                       }}
                       className="text-left p-2.5 bg-[#0F1219] border border-[#222736] hover:border-[#EA580C] rounded-lg transition-colors"
                     >
                       <div className="text-xs font-mono text-white truncate">{f.label}</div>
                       <div className="text-[11px] font-mono tabular-nums text-[#8E97AB] mt-1">
-                        {f.w}×{f.h}px · ({f.x}, {f.y})
+                        {f.w}×{f.h}px · {f.time.toFixed(2)}s
                       </div>
                     </button>
                   ))}
                 </div>
               </div>
             ) : viewTab === 'sheet' ? (
-              <div className="flex-1 overflow-y-auto p-5 space-y-4">
+              <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y p-4 sm:p-5 space-y-4">
                 {Object.entries(loadedImages).map(([pageName, img]) => (
                   <div key={pageName} className="space-y-2">
                     <div className="flex items-center justify-between text-xs font-mono text-[#9CA5B9]">
-                      <span>{pageName}</span>
-                      <span className="tabular-nums">
+                      <span className="truncate">{pageName}</span>
+                      <span className="tabular-nums shrink-0">
                         {img.naturalWidth} × {img.naturalHeight} px
                       </span>
                     </div>
@@ -581,15 +824,16 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
                 ))}
               </div>
             ) : (
-              <div className="flex-1 overflow-y-auto p-5">
+              <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y p-4 sm:p-5">
                 <pre className="text-xs font-mono text-[#C9D1E1] bg-[#0B0D12] border border-[#222736] rounded-lg p-4 overflow-x-auto">
                   {JSON.stringify(
-                    target.mode === 'spine'
+                    isSpineMode
                       ? {
                           skeleton: spineData?.skeleton,
                           bones: spineData?.bonesCount,
                           slots: spineData?.slotsCount,
                           skins: spineData?.skins,
+                          pages: spineData?.pages,
                           animations: spineData?.animations.map((a) => ({
                             name: a.name,
                             duration: a.duration,
@@ -610,38 +854,60 @@ export function SpinePlayerModal({ target, catalog, onClose }: SpinePlayerModalP
             )}
           </div>
 
-          {/* Right Track List (Spine only) */}
-          {target.mode === 'spine' && spineData && (
-            <aside className="w-full lg:w-64 border-t lg:border-t-0 lg:border-l border-[#222736] bg-[#0F1219] flex flex-col">
-              <div className="px-4 py-3 border-b border-[#222736] flex items-center gap-2 text-xs font-medium text-[#C9D1E1]">
-                <Layers className="w-3.5 h-3.5 text-[#EA580C]" />
-                <span>Faixas de Animação ({spineData.animations.length})</span>
+          {/* Right / Bottom Track List (Spine only) — independent bounded scroll */}
+          {hasTrackSidebar && (
+            <aside className="flex-1 min-h-0 lg:flex-none lg:w-72 border-t lg:border-t-0 lg:border-l border-[#222736] bg-[#0F1219] flex flex-col overflow-hidden">
+              <div className="shrink-0 px-3.5 py-2.5 border-b border-[#222736] space-y-2">
+                <div className="flex items-center justify-between gap-2 text-xs font-medium text-[#C9D1E1]">
+                  <span className="flex items-center gap-2">
+                    <Layers className="w-3.5 h-3.5 text-[#EA580C]" />
+                    <span>Faixas de Animação ({spineData.animations.length})</span>
+                  </span>
+                </div>
+                {spineData.animations.length > 6 && (
+                  <div className="relative">
+                    <Search className="w-3.5 h-3.5 text-[#7C859B] absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                    <input
+                      type="text"
+                      value={trackSearch}
+                      onChange={(e) => setTrackSearch(e.target.value)}
+                      placeholder="Filtrar faixa (ex: idle, skill, attack)..."
+                      className="w-full pl-8 pr-3 py-1.5 text-xs bg-[#161A25] border border-[#252B3B] focus:border-[#EA580C] rounded-md text-white placeholder-[#6E778C] outline-none"
+                    />
+                  </div>
+                )}
               </div>
-              <div className="flex-1 overflow-y-auto divide-y divide-[#1A1F2C]">
-                {spineData.animations.map((anim) => {
+
+              <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y divide-y divide-[#1A1F2C]">
+                {filteredAnimations.map((anim) => {
                   const active = anim.name === selectedAnim;
                   return (
                     <button
                       key={anim.name}
-                      onClick={() => {
-                        setSelectedAnim(anim.name);
-                        setFrameIndex(0);
-                        setPlaying(true);
-                      }}
-                      className={`w-full text-left px-4 py-2.5 transition-colors ${
-                        active ? 'bg-[#EA580C]/15 text-white' : 'text-[#A7B0C4] hover:bg-[#171B26]'
+                      onClick={() => handleSelectTrack(anim.name)}
+                      className={`w-full text-left px-4 py-2.5 transition-colors flex items-center justify-between gap-2 ${
+                        active
+                          ? 'bg-[#EA580C]/15 text-white border-l-2 border-[#EA580C]'
+                          : 'text-[#A7B0C4] hover:bg-[#171B26]'
                       }`}
                     >
-                      <div className="text-xs font-mono truncate">{anim.name}</div>
-                      <div className="text-[11px] font-mono tabular-nums text-[#7C859B] mt-0.5">
-                        {anim.duration}s · {anim.keyframeCount} keyframes
+                      <div className="min-w-0">
+                        <div className="text-xs font-mono truncate">{anim.name}</div>
+                        <div className="text-[11px] font-mono tabular-nums text-[#7C859B] mt-0.5">
+                          {anim.duration}s · {anim.keyframeCount} keyframes
+                        </div>
                       </div>
+                      {active && (
+                        <span className="text-[10px] font-mono uppercase text-[#FB923C] shrink-0">
+                          Ativa
+                        </span>
+                      )}
                     </button>
                   );
                 })}
-                {spineData.animations.length === 0 && (
+                {filteredAnimations.length === 0 && (
                   <div className="p-4 text-xs text-[#7C859B]">
-                    Nenhuma faixa nomeada neste skeleton.
+                    Nenhuma faixa corresponde ao filtro &quot;{trackSearch}&quot;.
                   </div>
                 )}
               </div>

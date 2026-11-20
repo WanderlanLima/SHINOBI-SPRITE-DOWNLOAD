@@ -999,6 +999,12 @@ export async function inspectSpineLive(
       }
     }
 
+    if (Array.isArray(anim?.events)) {
+      for (const ev of anim.events) {
+        if (typeof ev?.time === 'number' && ev.time > maxTime) maxTime = ev.time;
+      }
+    }
+
     attachmentFrames.sort((a, b) => a.time - b.time);
     return { name, duration: Number(maxTime.toFixed(3)), keyframeCount, attachmentFrames };
   });
