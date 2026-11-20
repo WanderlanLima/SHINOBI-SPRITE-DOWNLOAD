@@ -4,7 +4,7 @@ on:
   push:
     branches: ["main", "master"]
   schedule:
-    # Atualiza o catálogo automaticamente toda semana (domingo às 06:00 UTC)
+    # Atualiza o catálogo automaticamente toda semana (domingo às 06:00 .UTC)
     - cron: "0 6 * * 0"
   workflow_dispatch:
 
