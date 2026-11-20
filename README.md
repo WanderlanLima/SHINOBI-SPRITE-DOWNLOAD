@@ -13,6 +13,15 @@ Aplicação **100% estática** compatível com **GitHub Pages** e **download com
    - Publica automaticamente no endereço `https://<seu-usuario>.github.io/<seu-repositorio>/`.
 5. Você também pode reatualizar o catálogo quando o jogo lançar novos ninjas clicando em **Actions → Deploy Shinobi Vault para GitHub Pages → Run workflow**.
 
+### A página ficou toda branca no GitHub Pages?
+
+Se a página abrir branca, quase sempre significa que o GitHub Pages ainda está configurado em **Deploy from a branch** (`main` / `root`) em vez de **GitHub Actions** (o GitHub Pages não compila arquivos `.tsx` diretamente da branch):
+
+1. Confirme que a pasta `.github/workflows/deploy-pages.yml` está presente no repositório no GitHub (ao subir arquivos arrastando pelo navegador, pastas ocultas iniciadas com ponto `.` podem ser ignoradas — prefira `git push` ou crie o arquivo `.github/workflows/deploy-pages.yml` direto no GitHub).
+2. Vá em **Settings → Pages → Build and deployment → Source** e selecione **GitHub Actions** (não deixe *Deploy from a branch*).
+3. Abra a aba **Actions**, clique em **Deploy Shinobi Vault para GitHub Pages** e depois em **Run workflow**.
+4. Aguarde os dois passos (`build` e `deploy`) ficarem verdes e abra o link exibido na etapa `deploy`.
+
 ## Como fazer o download completo direto no celular
 
 1. Abra o link do seu GitHub Pages no navegador do celular (Chrome no Android ou Safari no iOS).

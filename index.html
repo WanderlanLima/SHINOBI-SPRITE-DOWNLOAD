@@ -13,9 +13,48 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,600;12..96,700&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
   </head>
-  <body class="bg-[#0B0D12] text-[#E6E9F0] antialiased selection:bg-[#EA580C]/30 selection:text-white">
+  <body
+    class="bg-[#0B0D12] text-[#E6E9F0] antialiased selection:bg-[#EA580C]/30 selection:text-white"
+    style="background-color:#0B0D12;color:#E6E9F0;margin:0;font-family:system-ui,-apple-system,sans-serif;"
+  >
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
+    <script>
+      (function () {
+        var lastErr = '';
+        window.addEventListener('error', function (e) {
+          if (e && e.message) lastErr = e.message;
+        });
+        window.addEventListener('unhandledrejection', function (e) {
+          if (e && e.reason) lastErr = String(e.reason.message || e.reason);
+        });
+        setTimeout(function () {
+          if (window.__SHINOBI_MOUNTED__) return;
+          var root = document.getElementById('root');
+          if (!root || root.childNodes.length > 0) return;
+          var rawTsx = !!document.querySelector('script[src*="/src/main.tsx"]');
+          var msg = rawTsx
+            ? 'O GitHub Pages está servindo o código-fonte bruto (branch main) em vez da versão compilada pelo GitHub Actions.'
+            : (lastErr || 'O navegador não conseguiu carregar o pacote JavaScript da aplicação.');
+          var steps = rawTsx
+            ? '<ol style="margin:12px 0 0;padding-left:20px;line-height:1.7;color:#D4DAE8;font-size:13px;">' +
+              '<li>No GitHub, abra <b>Settings → Pages</b>.</li>' +
+              '<li>Em <b>Build and deployment → Source</b>, troque de <i>Deploy from a branch</i> para <b>GitHub Actions</b>.</li>' +
+              '<li>Abra a aba <b>Actions</b>, selecione <b>Deploy Shinobi Vault para GitHub Pages</b> e clique em <b>Run workflow</b>.</li>' +
+              '<li>Aguarde ~1 minuto até ficar verde e recarregue esta página.</li>' +
+              '</ol>'
+            : '<p style="margin:12px 0 0;color:#9CA5B9;font-size:13px;">Tente recarregar a página ou limpar o cache do navegador.</p>';
+          root.innerHTML =
+            '<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;background:#0B0D12;">' +
+              '<div style="max-width:560px;width:100%;background:#13161F;border:1px solid #262C3D;border-radius:14px;padding:24px;">' +
+                '<div style="font-size:12px;text-transform:uppercase;letter-spacing:0.08em;color:#F97316;font-weight:600;margin-bottom:8px;">Shinobi Vault · Diagnóstico GitHub Pages</div>' +
+                '<h1 style="font-size:20px;font-weight:700;margin:0 0 10px;color:#FFFFFF;">Build estático não carregado</h1>' +
+                '<p style="font-size:14px;line-height:1.5;color:#FCA5A5;margin:0;">' + msg + '</p>' +
+                steps +
+              '</div>' +
+            '</div>';
+        }, 2500);
+      })();
+    </script>
   </body>
 </html>
-

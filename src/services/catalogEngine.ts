@@ -709,7 +709,12 @@ export async function loadStaticCatalog(
   onStage?: (stage: string) => void
 ): Promise<FullCatalog> {
   onStage?.('Lendo snapshot estático do acervo...');
-  const snapUrl = new URL('./data/studio-snapshot.json', window.location.href).toString();
+  const rawHref = window.location.href;
+  const baseHref =
+    window.location.pathname.endsWith('/') || window.location.pathname.endsWith('.html')
+      ? rawHref
+      : `${window.location.origin}${window.location.pathname}/${window.location.search}`;
+  const snapUrl = new URL('./data/studio-snapshot.json', baseHref).toString();
   const snapRes = await fetch(snapUrl);
   if (!snapRes.ok) {
     throw new Error(`Snapshot estático não encontrado (${snapRes.status}).`);
