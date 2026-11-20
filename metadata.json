@@ -1,0 +1,6 @@
+{
+  "name": "Shinobi Vault — Extrator e Banco de Dados Naruto JotaGame",
+  "description": "Banco de dados pesquisável e exportador organizado em ZIP para sprites de ninjas, invocações, animações Spine, habilidades, sons, dublagens, técnicas e atributos de naruto.jotagame.com.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
